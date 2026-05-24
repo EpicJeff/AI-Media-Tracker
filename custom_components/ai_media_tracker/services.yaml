@@ -1,0 +1,13 @@
+process_test_image:
+  name: AI Media Tracker - Process Test Image
+  description: Sends a local file frame to your configured Ollama VLM instance and pushes the structured telemetry attributes down to the specified media player proxy.
+  target:
+    entity:
+      integration: ai_media_tracker
+      domain: media_player
+  fields:
+    image_path:
+      name: Local Image File Path
+      description: Complete file system path tracking where your static test show photo lives.
+      required: true
+      example: "/config/www/images/test_sports_match.jpg"
