@@ -1,756 +1,1089 @@
-import base64
-import json
 import logging
-import os
-import io
-import voluptuous as vol
 import asyncio
+import hashlib
+import json
+import base64
+import re
+from collections import Counter, deque
 from datetime import timedelta
 
-# Official async Ollama engine client
-from ollama import AsyncClient
-
-from homeassistant.core import HomeAssistant, ServiceCall, Event
+from homeassistant.core import HomeAssistant, ServiceCall, Event, callback
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import Platform
+from homeassistant.const import Platform, STATE_PLAYING, STATE_ON
 from homeassistant.helpers import entity_registry as er
+import homeassistant.util.dt as dt_util
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.event import async_track_state_change_event
-import homeassistant.helpers.config_validation as cv
-from homeassistant.util import dt as dt_util
+
+# Local Imports
+from .const import DOMAIN
 from .artwork_manager import ArtworkManager
-from homeassistant.helpers.event import async_track_utc_time_change
-import hashlib
+from .managers.metadata_manager import MetadataManager
+from .managers.analysis_manager import AnalysisManager
+from .managers.sports_manager import SportsManager
+from .managers.metadata_hydrator import MetadataHydrator
+from .managers.guide_manager import GuideManager
+from .managers.guardrail_manager import GuardrailManager
+from .pipeline.resolver import resolve_media
+from .pipeline.native_stage import extract_native_state
+from .pipeline.vlm_stage import optimize_image_for_vlm, validate_vlm_result
 
 _LOGGER = logging.getLogger(__name__)
-PLATFORMS = [Platform.MEDIA_PLAYER, Platform.CAMERA]
-DOMAIN = "ai_media_tracker"
+PLATFORMS = [Platform.MEDIA_PLAYER, Platform.CAMERA, Platform.SENSOR]
 
-BLANK_JPEG = b'\xff\xd8\xff\xdb\x00C\x00\x08\x06\x06\x07\x06\x05\x08\x07\x07\x07\t\t\x08\n\x0c\x14\r\x0c\x0b\x0b\x0c\x19\x12\x13\x0f\x14\x1d\x1a\x1f\x1e\x1d\x1a\x1c\x1c $.\' ",#\x1c\x1c(7),01444\x1f\'9=82<.342\xff\xc0\x00\x0b\x08\x00\x01\x00\x01\x01\x01\x11\x00\xff\xc4\x00\x1f\x00\x00\x01\x05\x01\x01\x01\x01\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x01\x02\x03\x04\x05\x06\x07\x08\t\n\x0b\xff\xda\x00\x08\x01\x01\x00\x00\x3f\x00\xd2\xcf\xff\xd9'
-
-PROCESS_IMAGE_SCHEMA = vol.Schema({
-    vol.Required("image_path"): cv.string,
-}, extra=vol.ALLOW_EXTRA)
-
-def is_blank_or_black_image(image_bytes: bytes) -> bool:
-    """Detect if an image is empty or consists of a solid dark/black frame."""
-    if not image_bytes or image_bytes == BLANK_JPEG:
-        return True
-    try:
-        from PIL import Image
-        img = Image.open(io.BytesIO(image_bytes))
-        small_img = img.resize((8, 8)).convert("L")
-        pixels = list(small_img.getdata())
-        avg_brightness = sum(pixels) / len(pixels)
-        if avg_brightness < 15:
-            return True
-    except Exception:
-        pass
-    return False
-
-def is_likely_commercial(image_bytes: bytes) -> bool:
-    """
-    Detect if an image is likely a commercial based on high-entropy color distribution.
-    Sports typically have dominant colors (green, wood, ice) while ads are visually noisy.
-    """
-    try:
-        from PIL import Image, ImageStat
-        img = Image.open(io.BytesIO(image_bytes))
-        stat = ImageStat.Stat(img)
-        
-        # High standard deviation across RGB channels indicates high visual complexity/noise
-        # typical of fast-paced, high-contrast advertisements.
-        avg_stddev = sum(stat.stddev) / len(stat.stddev)
-        
-        _LOGGER.debug("Commercial entropy check: stddev=%f", avg_stddev)
-        if avg_stddev > 85: # Threshold for 'high noise'
-            return True
-    except Exception:
-        pass
-    return False
+def is_sport_title(title: str) -> bool:
+    """Helper to quickly block TMDB/Guide checks if the title implies a sporting event."""
+    if not title: return False
+    title_lower = title.lower().strip()
+    known_sports = {"baseball", "softball", "football", "basketball", "hockey", "soccer", "cricket", "nascar", "f1", "golf", "tennis", "mma", "ufc", "boxing", "rugby", "volleyball", "lacrosse"}
+    known_leagues = {"mlb", "nba", "nfl", "nhl", "mls", "premier league", "champions league", "atp", "wta", "ncaa", "wnba", "pga", "lpga", "fifa", "fa cup"}
+    title_words = set(title_lower.split())
+    return bool(title_words.intersection(known_sports) or title_words.intersection(known_leagues) or any(marker in title_lower for marker in [" vs ", " @ ", " at "]))
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
-    """Set up AI Media Tracker from a config entry."""
-    # Ensure the root domain space exists
+    """Set up AI Media Tracker integration with full orchestration logic."""
     hass.data.setdefault(DOMAIN, {})
     
-    # SAFE INITIALIZATION: Create the entry bucket first if it doesn't exist
-    if entry.entry_id not in hass.data[DOMAIN]:
-        hass.data[DOMAIN][entry.entry_id] = {}
+    meta_mgr = MetadataManager(hass)
+    anal_mgr = AnalysisManager()
+    artwork_mgr = ArtworkManager(hass, entry)
+    sports_mgr = SportsManager(hass, entry.entry_id)
+    gracenote_key = entry.options.get("gracenote_api_key", entry.data.get("gracenote_api_key"))
+    guide_mgr = GuideManager(hass, gracenote_key)
+    
+    tmdb_key = entry.options.get("tmdb_api_key", entry.data.get("tmdb_api_key"))
+    logo_key = entry.options.get("logo_dev_api_key", entry.data.get("logo_dev_api_key"))
+    meta_hydrator = MetadataHydrator(hass, tmdb_key)
+    guardrail_mgr = GuardrailManager(hass, entry)
+    
+    from .managers.routing_manager import AudioProxyView, VideoProxyView, WebSocketProxyView, ActiveCastProxyView
+    hass.http.register_view(AudioProxyView(hass))
+    hass.http.register_view(VideoProxyView(hass))
+    hass.http.register_view(WebSocketProxyView(hass))
+    hass.http.register_view(ActiveCastProxyView(hass))
+    
+    from .managers.storage_manager import StorageManager
+    storage_mgr = StorageManager(hass)
+    await storage_mgr.async_load()
+    
+    hass.data[DOMAIN][entry.entry_id] = {
+        "metadata_mgr": meta_mgr,
+        "storage_mgr": storage_mgr,
+        "analysis_mgr": anal_mgr,
+        "artwork_mgr": artwork_mgr,
+        "sports_mgr": sports_mgr,
+        "meta_hydrator": meta_hydrator,
+        "guide_mgr": guide_mgr,
+        "guardrail_mgr": guardrail_mgr,
+        "media_players": {},       
+        "cameras": {},       
+        "player_to_source": {}, 
+        "unsub_listeners": [],
+        "watchdogs": {},
+        "pending_settle_tasks": {},
+        "pending_state_handlers": {}
+    }
 
-    # Now we can safely check for or create the artwork manager instance
-    artwork_mgr = hass.data[DOMAIN][entry.entry_id].get("artwork_manager")
-    if not artwork_mgr:
-        artwork_mgr = ArtworkManager(hass, entry)
+    _kickstarting_entities = set()
+    _active_watchdogs = hass.data[DOMAIN][entry.entry_id]["watchdogs"]
+    _pending_settle_tasks = hass.data[DOMAIN][entry.entry_id]["pending_settle_tasks"]
+    _pending_state_handlers = hass.data[DOMAIN][entry.entry_id]["pending_state_handlers"]
+    last_trigger_times = {}
 
-    # Re-verify the full storage schema structure is fully mapped out
-    hass.data[DOMAIN][entry.entry_id].update({
-        "players": hass.data[DOMAIN][entry.entry_id].get("players", {}),
-        "cameras": hass.data[DOMAIN][entry.entry_id].get("cameras", {}),
-        "metadata": hass.data[DOMAIN][entry.entry_id].get("metadata", {}),
-        "artwork_manager": artwork_mgr
-    })
-
-    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
-
+    ent_reg = er.async_get(hass)
     tracked_media_players = []
     entity_to_player_name_map = {}
-    last_trigger_times = {}
-    _kickstarting_entities = set()
-    _pending_settle_tasks = {}
+    player_to_source = {}
 
-    def get_device_offset(entity_id: str) -> int:
-        """
-        Generate a deterministic delay (0-120 seconds) based on the entity_id.
-        This ensures the same device always uses the same offset.
-        """
-        hash_val = int(hashlib.md5(entity_id.encode()).hexdigest(), 16)
-        return hash_val % 120 # 0 to 120 seconds offset
+    configured_devices = entry.data.get("devices", [])
+    for dev_conf in configured_devices:
+        dev_id = dev_conf.get("device_id")
+        if not dev_id: continue
 
-    async def trigger_vlm_analysis(entity_id: str):
-        """Trigger the VLM analysis for a specific entity."""
-        player_name = entity_to_player_name_map.get(entity_id)
-        if not player_name:
-            return
+        child_entries = er.async_entries_for_device(ent_reg, dev_id)
+        media_player_entity = next((e for e in child_entries if e.domain == "media_player"), None)
 
-        cameras = hass.data[DOMAIN][entry.entry_id].get("cameras", {})
-        cam_obj = cameras.get(player_name)
+        if media_player_entity:
+            entity_id = media_player_entity.entity_id
+            tracked_media_players.append(entity_id)
+            player_name = dev_conf.get("name")
+            entity_to_player_name_map[entity_id] = player_name
+            player_to_source[player_name] = entity_id
+            _LOGGER.info("AI Media Tracker hooked device: %s", player_name)
 
-        if not cam_obj:
-            return
+    hass.data[DOMAIN][entry.entry_id]["player_to_source"] = player_to_source
+    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
-        try:
-            image_bytes = await cam_obj.async_camera_image()
-            if image_bytes:
-                await async_analyze_frame_internal(hass, entry, player_name, image_bytes)
-        except Exception as ex:
-            _LOGGER.error("Failed executing VLM analysis for %s: %s", player_name, ex)
-
-    async def _periodic_vlm_scan(now):
-        """
-        The main listener that triggers the staggered analysis.
-        """
-        _LOGGER.info("Periodic VLM sync: Initiating staggered check at %s", now)
-
-        async def _analyze_after_delay(entity_id, state):
-            delay = get_device_offset(entity_id)
-            _LOGGER.debug("Staggering analysis for %s by %d seconds", entity_id, delay)
-            await asyncio.sleep(delay)
-            
-            # Re-check state after delay to ensure it's still playing
-            current_state = hass.states.get(entity_id)
-            if not current_state or current_state.state != "playing":
-                return
-
-            # Check if metadata is sufficient before triggering VLM
-            if is_metadata_sufficient(current_state):
-                _LOGGER.debug("Periodic check: Native metadata found for %s. Skipping VLM.", entity_id)
-                await update_proxy_from_native(entity_id, current_state)
-                return
-
-            await trigger_vlm_analysis(entity_id)
-
-        for entity_id in tracked_media_players:
-            state = hass.states.get(entity_id)
-            if state and state.state == "playing":
-                # Fire a background task for each device so they don't block each other
-                hass.async_create_task(_analyze_after_delay(entity_id, state))
-
-    # --- Hooking it up in async_setup_entry ---
-    # Trigger at :28 and :58 (2 minutes before the hour/half-hour)
-    async_track_utc_time_change(hass, _periodic_vlm_scan, minute=[0, 30], second=0)
-
-    async def _setup_event_listeners():
-        entity_reg = er.async_get(hass)
-        devices_list = entry.data.get("devices", [])
+    def is_app_silent(state) -> bool:
+        if not state: return True
+        title = (state.attributes.get("media_title") or "").lower().strip()
+        series_title = (state.attributes.get("media_series_title") or "").lower().strip()
+        blacklisted = {"unknown", "none", "home", "dashboard", "top charts", "tv", "apple tv", "android tv", "google tv", "youtube", "netflix", "disney+", "disney plus", "hulu", "hbo max", "max", "paramount+", "peacock", "prime video", "amazon", "vudu"}
         
-        for dev_config in devices_list:
-            dev_id = dev_config.get("device_id")
-            if not dev_id:
-                continue
-
-            child_entries = er.async_entries_for_device(entity_reg, dev_id)
-            media_player_entity = next((e for e in child_entries if e.domain == "media_player"), None)
-
-            if media_player_entity:
-                entity_id = media_player_entity.entity_id
-                tracked_media_players.append(entity_id)
-                player_name = dev_config.get("name")
-                entity_to_player_name_map[entity_id] = player_name
-                _LOGGER.info("AI Media Tracker hooked device state listener for %s (%s)", player_name, entity_id)
-
-        def is_app_silent(state) -> bool:
-            """Check if the app is reporting no info or just its own name."""
-            if not state:
-                return True
-            title = (state.attributes.get("media_title") or "").lower().strip()
-            if not title:
-                return True
+        if series_title and series_title not in blacklisted:
+            return False
             
-            blacklisted_titles = {
-                "unknown", "none", "home", "dashboard", "top charts", "tv", 
-                "apple tv", "android tv", "google tv", "youtube",
-                "netflix", "disney+", "disney plus", "hulu", "hbo max", "max", 
-                "paramount+", "peacock", "prime video", "amazon", "vudu"
-            }
-            return title in blacklisted_titles
+        return not title or title in blacklisted
 
-        def is_metadata_sufficient(state) -> bool:
-            """Check if the native media player state already has enough info to skip VLM."""
-            if not state:
-                return False
 
-            title = state.attributes.get("media_title")
-            if not title:
-                return False
 
-            title_lower = title.lower().strip()
+    def is_metadata_sufficient(state) -> bool:
+        if not state: return False
+        title = state.attributes.get("media_title")
+        series_title = state.attributes.get("media_series_title")
+        
+        if not title and not series_title: return False
 
-            # 1. SILENT CHECK: If it's a blacklisted title, it's not sufficient.
-            if is_app_silent(state):
-                return False
+        check_title = series_title if series_title else title
+        title_lower = check_title.lower().strip()
+        
+        if is_app_silent(state): return False
 
-            # 2. SPORTS CHECK: 
-            # Even if the title looks like a matchup (e.g., "Lakers vs Celtics"), 
-            # it is NOT sufficient for our artwork engine. We want VLM to identify 
-            # the specific sport and league so we can find the correct logos/colors.
-            known_sports = {
-                "baseball", "softball", "football", "basketball", "hockey", "soccer", 
-                "cricket", "nascar", "f1", "golf", "tennis", "mma", "ufc", "boxing",
-                "rugby", "volleyball", "lacrosse"
-            }
-            title_words = set(title_lower.split())
-            is_sport = title_words.intersection(known_sports) or any(marker in title_lower for marker in [" vs ", " @ ", " v ", " at "])
+        live_tv_apps = {"directv", "directv stream", "youtube tv", "hulu", "fubo", "sling"}
+        app_name = (state.attributes.get("app_name") or state.attributes.get("source") or "").lower().strip()
+        if any(live_app in app_name for live_app in live_tv_apps):
+            return False
             
-            if is_sport:
-                _LOGGER.info("Sports detected in metadata: '%s'. Triggering VLM for league/logo enrichment.", title)
-                return False
+        svod_apps_missing_series = {"hbo max", "max", "peacock"}
+        if any(svod in app_name for svod in svod_apps_missing_series) and not series_title:
+            return False
 
-            # 3. NATIVE METADATA (Movies/Shows):
-            # If it's a long title (likely a movie or show) and not a sport, it's sufficient.
-            if len(title) > 15:
-                return True
+        known_sports = {"baseball", "softball", "football", "basketball", "hockey", "soccer", "cricket", "nascar", "f1", "golf", "tennis", "mma", "ufc", "boxing", "rugby", "volleyball", "lacrosse"}
+        title_words = set(title_lower.split())
+        is_sport = title_words.intersection(known_sports) or any(marker in title_lower for marker in [" vs ", " @ ", " v ", " at "])
+        
+        if is_sport: return False
+        if len(check_title) > 15: return True
+        return True
 
-            return True
+    async def update_proxy_from_native(entity_id: str, state):
+        player_name = entity_to_player_name_map.get(entity_id)
+        if not player_name: return
 
-        async def update_proxy_from_native(entity_id: str, state):
-            """Update the proxy player directly from the source's native attributes."""
-            player_name = entity_to_player_name_map.get(entity_id)
-            if not player_name:
-                return
+        original_title = state.attributes.get("media_title")
+        series_title = state.attributes.get("media_series_title")
+        
+        search_title = series_title if series_title else original_title
 
-            title = state.attributes.get("media_title")
-            app_name = state.attributes.get("app_name") or state.attributes.get("source")
+        app_name = state.attributes.get("app_name") or state.attributes.get("source")
+        app_name_lower = (app_name or "").lower().strip()
 
-            _LOGGER.info("Using native metadata for %s: %s (App: %s)", player_name, title, app_name)
+        sports_mgr.stop_tracking(player_name)
+        sports_mgr.clear_sports_data(player_name)
 
-            artwork_manager = hass.data[DOMAIN][entry.entry_id]["artwork_manager"]
-            resolved_poster_url = await artwork_manager.async_get_artwork(
-                title, 
-                channel_name=app_name
-            )
+        # 1. Deterministic EPG TV Guide Cross-Reference
+        resolved_channel = app_name
+        candidate_networks = await guide_mgr.get_candidate_channels(search_title)
+        if candidate_networks:
+            resolved_channel = candidate_networks[0]
+            _LOGGER.info("EPG matched program '%s' directly with network: %s", search_title, resolved_channel)
 
-            metadata_bucket = hass.data[DOMAIN][entry.entry_id]["metadata"]
-            metadata_bucket[player_name] = {
-                "title": title,
-                "state": state.state,
-                "entity_picture": resolved_poster_url,
-                "extra_attributes": {
-                    "app_name": app_name,
-                    "native_metadata": True,
-                    "vlm_analysis": False
-                }
+        is_missing_series = (app_name_lower in {"hbo max", "max"} and not series_title)
+        rich_metadata = {}
+
+        # PREVENT UNNECESSARY SHOW DATA PULLS FOR SPORTS OR INCOMPLETE SVOD METADATA
+        if not is_missing_series and search_title not in ("Browsing...", "Unknown"):
+            if not is_sport_title(search_title):
+                # 1. Deterministic TV Guide Cross-Referencing Match
+                candidate_networks = await guide_mgr.get_candidate_channels(search_title)
+                if candidate_networks:
+                    resolved_channel = candidate_networks[0]
+                    _LOGGER.info("EPG matched program '%s' directly with network: %s", search_title, resolved_channel)
+
+                # 2. TMDB Hydration
+                rich_metadata = await meta_hydrator.hydrate(search_title)
+            else:
+                _LOGGER.debug("Skipping EPG and TMDB fetch for suspected sports broadcast: '%s'", search_title)
+                
+        # Always fetch artwork to ensure logos load, but drop title if missing series to avoid bad poster grabs
+        safe_title = "" if is_missing_series or search_title in ("Browsing...", "Unknown") else search_title
+        assets = await artwork_mgr.async_get_artwork(safe_title, channel_name=resolved_channel)
+
+        meta_mgr.merge(player_name, {
+            "title": original_title, 
+            "native_title": original_title,
+            "series_title": series_title,
+            "state": state.state, 
+            "entity_picture": assets.get("poster"), 
+            "logo_url": assets.get("logo"),
+            "extra_attributes": {
+                "app_name": app_name, 
+                "channel_platform_name": resolved_channel,
+                "native_metadata": True, 
+                "vlm_analysis": False,
+                "show_info": rich_metadata
             }
+        })
+        
+        if player_obj := hass.data[DOMAIN][entry.entry_id].get("players", {}).get(player_name):
+            player_obj.async_write_ha_state()
 
-            players = hass.data[DOMAIN][entry.entry_id].get("players", {})
-            player_obj = players.get(player_name)
-            if player_obj:
-                player_obj.async_write_ha_state()
+    def _start_watchdog_loop(entity_id: str, player_name: str, force_full_parse: bool = False):
+        if entity_id in _active_watchdogs:
+            _active_watchdogs[entity_id].cancel()
+            
+        cam = hass.data[DOMAIN][entry.entry_id].get("cameras", {}).get(player_name)
+        if not cam: return
+        
+        _active_watchdogs[entity_id] = hass.async_create_task(
+            async_watchdog_loop(hass, entry, entity_id, player_name, cam, force_full_parse)
+        )
 
-        async def kickstart_metadata(entity_id: str):
-            """Perform a quick pause/play cycle to force OSD visibility for VLM."""
-            if entity_id in _kickstarting_entities:
-                return
-
-            player_name = entity_to_player_name_map.get(entity_id)
-            _LOGGER.info("Kick-starting metadata OSD for %s...", player_name)
-
-            _kickstarting_entities.add(entity_id)
-            try:
-                # 1. Send Pause
-                await hass.services.async_call(
-                    "media_player", "media_pause", 
-                    {"entity_id": entity_id}, 
-                    blocking=True
-                )
-
-                # 2. Wait for OSD to animate in
-                await asyncio.sleep(1.5)
-
-                # 3. Capture the frame while OSD is visible
-                cameras = hass.data[DOMAIN][entry.entry_id].get("cameras", {})
-                cam_obj = cameras.get(player_name)
-                if cam_obj:
-                    image_bytes = await cam_obj.async_camera_image()
-                    if image_bytes:
-                        # Process via VLM
-                        hass.async_create_task(
-                            async_analyze_frame_internal(hass, entry, player_name, image_bytes)
-                        )
-
-                # 4. Resume Playback
-                await hass.services.async_call(
-                    "media_player", "media_play", 
-                    {"entity_id": entity_id}, 
-                    blocking=True
-                )
-
-            except Exception as ex:
-                _LOGGER.error("Failed kick-starting metadata for %s: %s", player_name, ex)
-            finally:
-                # Give the play command a moment to propagate before clearing the guard
+    async def kickstart_metadata(entity_id: str):
+        if entity_id in _kickstarting_entities: return
+        player_name = entity_to_player_name_map.get(entity_id)
+        _kickstarting_entities.add(entity_id)
+        
+        try:
+            await hass.services.async_call("media_player", "media_pause", {"entity_id": entity_id}, blocking=True)
+            await asyncio.sleep(1.0)
+            _start_watchdog_loop(entity_id, player_name)
+            await hass.services.async_call("media_player", "media_play", {"entity_id": entity_id}, blocking=True)
+        except Exception as ex:
+            _LOGGER.error("Failed kickstart for %s: %s", player_name, ex)
+        finally:
+            async def _cleanup():
                 await asyncio.sleep(2.0)
                 _kickstarting_entities.discard(entity_id)
-        async def _handle_streaming_state_change(event: Event) -> None:
-            entity_id = event.data.get("entity_id")
+            hass.async_create_task(_cleanup())
+
+    @callback
+    def _handle_streaming_state_change(event: Event) -> None:
+        entity_id = event.data.get("entity_id")
+        old_state = event.data.get("old_state")
+        new_state = event.data.get("new_state")
+
+        if not new_state: return
+
+        player_name = entity_to_player_name_map.get(entity_id)
+        if not player_name: return
+
+        app_name_attr = new_state.attributes.get("app_name")
+        display_app = app_name_attr
+        app_name = display_app
+        
+        _LOGGER.warning("MASTER DEBUG: Received event for %s. State: %s, HA Native App: %s", player_name, new_state.state, app_name_attr)
+
+        current_meta = meta_mgr.get(player_name)
+        current_state = current_meta.state
+
+        new_duration = new_state.attributes.get("media_duration")
+
+        async def _async_resolve_browsing_state():
+            true_app_name = None
+            query_success = False
+            try:
+                from homeassistant.helpers import entity_registry as er
+                registry = er.async_get(hass)
+                entity = registry.async_get(entity_id)
+                if not entity: _LOGGER.info("PyATV Debug: Entity not found")
+                elif not entity.config_entry_id: _LOGGER.info("PyATV Debug: config_entry_id missing")
+                else:
+                    atv = None
+                    # Method 1: New HA ConfigEntry runtime_data
+                    config_entry = hass.config_entries.async_get_entry(entity.config_entry_id)
+                    if config_entry:
+                        manager = getattr(config_entry, "runtime_data", None)
+                        if manager: atv = getattr(manager, "atv", None)
+                        
+                    # Method 2: Entity Component extraction
+                    if not atv:
+                        component = hass.data.get("entity_components", {}).get("media_player")
+                        if component:
+                            entity_obj = component.get_entity(entity_id)
+                            if entity_obj:
+                                manager = getattr(entity_obj, "manager", None)
+                                if manager: atv = getattr(manager, "atv", None)
+                                
+                    if atv:
+                        app = atv.metadata.app
+                        query_success = True
+                        if app:
+                            true_app_name = app.name
+                            _LOGGER.info("PyATV Debug: pyatv returned app: %s id: %s", app.name, app.identifier)
+                        else:
+                            _LOGGER.info("PyATV Debug: pyatv returned None app!")
+                    else:
+                        _LOGGER.info("PyATV Debug: completely failed to locate the PyATV instance inside HA.")
+            except Exception as e:
+                _LOGGER.info("PyATV Debug: PyATV exception: %s", e)
             
-            # GUARD: Ignore all state changes while this entity is currently undergoing a Kick-Start
-            if entity_id in _kickstarting_entities:
-                return
+            # If pyatv query succeeded, trust it completely (even if it returns None, meaning Home Screen).
+            # Otherwise fallback to HA's display_app
+            final_app = true_app_name if query_success else display_app
+            
+            # --- GHOST SESSION FILTER ---
+            ghost_app_name = None
+            if old_state and new_state.state in ("paused", "idle"):
+                old_app = current_meta.app_name
+                # If the app changed to a DIFFERENT valid app, it is almost certainly a ghost fallback.
+                # We catch both 'paused' and 'idle' fallbacks.
+                if old_app and final_app and final_app != old_app:
+                    _LOGGER.warning("AI Media Tracker: Ghost session detected! Apple TV abruptly fell back to '%s' (%s). Forcing it to remain on '%s'.", final_app, new_state.state, old_app)
+                    final_app = old_app
+                    ghost_app_name = old_app
+            # ----------------------------
+            
+            is_browsing = False
+            
+            if new_state.state in ("idle", "standby") and final_app:
+                # If it's a silent app, it might just be buffering or paused. We don't want to instantly assume browsing.
+                if not is_app_silent(new_state):
+                    is_browsing = True
+                
+            if new_state.state == "paused" and final_app:
+                # Silent apps never have duration, so we can't use 'not new_duration' to assume they are browsing.
+                # We must let VLM run to figure out if it's browsing or a paused movie.
+                if not is_app_silent(new_state) and not new_duration:
+                    is_browsing = True
+                
+            if ghost_app_name:
+                is_browsing = True
+                
+            if not final_app and new_state.state in ("idle", "paused", "standby"):
+                is_browsing = True
 
-            new_state = event.data.get("new_state")
-            old_state = event.data.get("old_state")
+            if old_state and old_state.state != new_state.state:
+                if entity_id in _active_watchdogs and entity_id not in _kickstarting_entities:
+                    _active_watchdogs[entity_id].cancel()
+                    _active_watchdogs.pop(entity_id, None)
+                    _LOGGER.info("AI Media Tracker: Adaptive Watchdog Loop for %s cancelled due to state change (%s -> %s).", player_name, old_state.state, new_state.state)
+            if new_state.state in ("off", "standby", "unavailable") or is_browsing:
+                if entity_id in _active_watchdogs:
+                    _active_watchdogs[entity_id].cancel()
+                    _active_watchdogs.pop(entity_id, None)
+                    _LOGGER.info("AI Media Tracker: Adaptive Watchdog Loop for %s cancelled.", player_name)
 
-            if not new_state:
-                return
+                sports_mgr.stop_tracking(player_name)
+                sports_mgr.clear_sports_data(player_name)
 
-            player_name = entity_to_player_name_map.get(entity_id)
-            metadata_bucket = hass.data[DOMAIN][entry.entry_id]["metadata"]
-            current_meta = metadata_bucket.get(player_name, {})
-            current_state = current_meta.get("state", "playing")
-
-            if new_state.state in ("off", "standby", "unavailable"):
-                if current_state != "idle":
-                    _LOGGER.info("Device event: %s changed to %s. Moving proxy to idle.", player_name, new_state.state)
-                    metadata_bucket[player_name] = {
-                        "title": "System Standby",
-                        "state": "idle",
+                if is_browsing:
+                    meta_mgr.merge(player_name, {
+                        "title": "Browsing...",
+                        "series_title": None,
+                        "state": "paused",
                         "entity_picture": None,
-                        "extra_attributes": {}
-                    }
-                    players = hass.data[DOMAIN][entry.entry_id].get("players", {})
-                    player_obj = players.get(player_name)
-                    if player_obj:
-                        player_obj.async_write_ha_state()
-                return
+                        "extra_attributes": {
+                            "app_name": final_app,
+                            "channel_platform_name": final_app,
+                            "native_metadata": False,
+                            "vlm_analysis": False
+                        }
+                    })
+                    
+                    async def fetch_logo_and_update():
+                        assets = await hass.data[DOMAIN][entry.entry_id]["artwork_mgr"].async_get_artwork("", channel_name=final_app)
+                        if assets.get("logo"):
+                            meta_mgr.merge(player_name, {"logo_url": assets.get("logo")})
+                            if p := hass.data[DOMAIN][entry.entry_id].get("players", {}).get(player_name): p.async_write_ha_state()
+                    hass.async_create_task(fetch_logo_and_update())
+                    
+                    if p := hass.data[DOMAIN][entry.entry_id].get("players", {}).get(player_name): p.async_write_ha_state()
+                elif current_state != "idle":
+                    meta_mgr.merge(player_name, {"title": "System Standby", "state": "idle", "entity_picture": None, "logo_url": None, "extra_attributes": {}})
+                    if p := hass.data[DOMAIN][entry.entry_id].get("players", {}).get(player_name): p.async_write_ha_state()
+                return True
+            return False
 
-            if new_state.state == "paused" and old_state and old_state.state == "paused":
-                return
+        async def _async_handle_state_change():
+            exited_early = await _async_resolve_browsing_state()
+            if exited_early: return
+
+            if new_state.state == "paused" and old_state and old_state.state == "paused": return
 
             state_changed_to_playing = (new_state.state == "playing" and (not old_state or old_state.state != "playing"))
+            state_changed_to_paused_idle = (new_state.state in ("idle", "paused") and (not old_state or old_state.state not in ("idle", "paused")))
             is_resume_from_pause = (new_state.state == "playing" and old_state and old_state.state == "paused")
-            
             old_app = old_state.attributes.get("app_name") if old_state else None
             new_app = new_state.attributes.get("app_name")
-            app_switched = (new_app is not None and new_app != old_app)
+            app_switched = (new_app != old_app)
 
             old_title = old_state.attributes.get("media_title") if old_state else None
             new_title = new_state.attributes.get("media_title")
-            metadata_changed = (new_title is not None and new_title != old_title)
+            metadata_changed = (new_title != old_title)
 
-            if state_changed_to_playing or app_switched or metadata_changed:
+            old_duration = old_state.attributes.get("media_duration") if old_state else None
+            new_duration = new_state.attributes.get("media_duration")
+            duration_changed = (new_duration != old_duration)
+
+            if is_resume_from_pause and not (app_switched or metadata_changed or duration_changed):
+                return
+
+            if state_changed_to_playing or app_switched or metadata_changed or duration_changed or state_changed_to_paused_idle:
                 now = dt_util.utcnow()
                 last_run = last_trigger_times.get(entity_id)
 
-                # DEBOUNCE LOGIC
                 if last_run and (now - last_run) < timedelta(seconds=8):
-                    if not (state_changed_to_playing or app_switched):
-                        _LOGGER.debug("Suppressing rapid remote control telemetry click variance on %s", player_name)
-                        return
+                    if not (state_changed_to_playing or app_switched or metadata_changed or duration_changed): return
 
                 last_trigger_times[entity_id] = now
+                sports_mgr.stop_tracking(player_name)
                 
-                # CANCEL PENDING TASKS: If an analysis timer is already running for this entity, 
-                # cancel it. We only want the *latest* state change to drive the analysis.
-                if entity_id in _pending_settle_tasks:
-                    _pending_settle_tasks[entity_id].cancel()
+                if not is_app_silent(new_state):
+                     hass.async_create_task(update_proxy_from_native(entity_id, new_state))
                 
-                # Diagnostic logging for trigger state
-                _LOGGER.debug(
-                    "Analysis Trigger [%s]: %s -> %s | resume=%s, app_switch=%s, meta_change=%s",
-                    player_name, 
-                    old_state.state if old_state else "None", 
-                    new_state.state, 
-                    is_resume_from_pause, 
-                    app_switched, 
-                    metadata_changed
-                )
+                if entity_id in _pending_settle_tasks: _pending_settle_tasks[entity_id].cancel()
+                if entity_id in _active_watchdogs:
+                    _active_watchdogs[entity_id].cancel()
+                    _active_watchdogs.pop(entity_id, None)
                 
-                # --- METADATA FIRST CHECK ---
-                if is_metadata_sufficient(new_state):
-                    _LOGGER.info("Metadata update detected for %s. Updating proxy.", player_name)
-                    hass.async_create_task(update_proxy_from_native(entity_id, new_state))
+                app_name_new = (new_state.attributes.get("app_name") or new_state.attributes.get("source") or "").lower().strip()
+                series_title_new = new_state.attributes.get("media_series_title")
+                needs_vlm_kick_initial = is_app_silent(new_state) or (app_name_new in {"hbo max", "max"} and not series_title_new)
+                
+                if is_metadata_sufficient(new_state) and not needs_vlm_kick_initial:
                     return
 
-                # --- METADATA SETTLING DELAY ---
-                async def _settle_and_trigger():
+                async def _settle_and_trigger(duration_changed_flag=False, metadata_changed_flag=False):
                     try:
-                        _LOGGER.debug("Metadata insufficient for %s. Waiting 2.5s for EPG/Metadata to settle...", player_name)
-                        await asyncio.sleep(2.5)
-                        
-                        # GUARD: If a kickstart was launched by another process while we slept, abort.
-                        if entity_id in _kickstarting_entities:
-                            return
+                        await asyncio.sleep(2.0)
+                        if entity_id in _kickstarting_entities: return
 
                         fresh_state = hass.states.get(entity_id)
-                        if not fresh_state or fresh_state.state != "playing":
-                            return
+                        # Process playing, paused, AND idle states so VLM can analyze menus and paused shows
+                        if not fresh_state or fresh_state.state not in ("playing", "paused", "idle"): return
 
-                        if is_metadata_sufficient(fresh_state):
-                            _LOGGER.info("Metadata settled for %s. Bypassing VLM.", player_name)
-                            await update_proxy_from_native(entity_id, fresh_state)
-                            return
-
-                        has_existing_title = current_meta.get("title") not in (None, "Unknown", "System Standby", "")
                         silent = is_app_silent(fresh_state)
                         
-                        if not is_resume_from_pause and silent and (app_switched or current_state == "idle" or metadata_changed or not has_existing_title):
-                            _LOGGER.info("Truly silent app detected on %s. Initiating Kick-Start...", player_name)
-                            await kickstart_metadata(entity_id)
+                        app_name_attr = fresh_state.attributes.get("app_name")
+                        display_app = app_name_attr or "App"
+                        app_name_fresh = display_app
+
+                        if not silent:
+                            await update_proxy_from_native(entity_id, fresh_state)
                         else:
-                            _LOGGER.info("Enriching metadata via standard VLM for %s (Silent=%s, AppSwitch=%s).", 
-                                         player_name, silent, app_switched)
-                            await trigger_vlm_analysis(entity_id)
-                    except asyncio.CancelledError:
-                        _LOGGER.debug("Settling task for %s was superseded by a newer event. Cancelling.", player_name)
-                    finally:
-                        _pending_settle_tasks.pop(entity_id, None)
+                            has_rich_title = current_meta.title and current_meta.title not in ("Browsing...", "Loading Info...", "System Standby", "Unknown", "", "Home Screen")
+                            
+                            if (app_switched or state_changed_to_playing) and not has_rich_title:
+                                meta_mgr.merge(player_name, {
+                                    "title": "Loading Info...",
+                                    "series_title": None,
+                                    "state": fresh_state.state,
+                                    "entity_picture": None,
+                                    "extra_attributes": {
+                                        "app_name": app_name_fresh,
+                                        "channel_platform_name": app_name_fresh,
+                                        "native_metadata": False,
+                                        "vlm_analysis": False
+                                    }
+                                })
+                                async def fetch_logo_and_update():
+                                    assets = await hass.data[DOMAIN][entry.entry_id]["artwork_mgr"].async_get_artwork("", channel_name=app_name_fresh)
+                                    if assets.get("logo"):
+                                        meta_mgr.merge(player_name, {"logo_url": assets.get("logo")})
+                                        if p := hass.data[DOMAIN][entry.entry_id].get("players", {}).get(player_name): p.async_write_ha_state()
+                                hass.async_create_task(fetch_logo_and_update())
+                                if p := hass.data[DOMAIN][entry.entry_id].get("players", {}).get(player_name): p.async_write_ha_state()
 
-                # Store the task so it can be cancelled if another event arrives
-                _pending_settle_tasks[entity_id] = hass.async_create_task(_settle_and_trigger())
-        if tracked_media_players:
-            entry.async_on_unload(
-                async_track_state_change_event(hass, tracked_media_players, _handle_streaming_state_change)
-            )
+                        has_existing_title = current_meta.title not in (None, "Unknown", "System Standby", "", "Browsing...", "Loading Info...", "Home Screen")
+                        
+                        app_name = (fresh_state.attributes.get("app_name") or fresh_state.attributes.get("source") or "").lower().strip()
+                        series_title = fresh_state.attributes.get("media_series_title")
+                        needs_vlm_kick = silent or (app_name in {"hbo max", "max"} and not series_title)
+                        
+                        if fresh_state.state == "playing" and not needs_vlm_kick and is_metadata_sufficient(fresh_state):
+                            return
 
-    hass.async_create_task(_setup_event_listeners())
+                        is_from_browsing = (current_meta.title == "Browsing...")
+                        if fresh_state.state == "playing":
+                            import time
+                            recently_kickstarted = (time.time() - current_meta.last_kickstart) < 10.0
+                            if not recently_kickstarted and needs_vlm_kick and (app_switched or current_state == "idle" or is_from_browsing or metadata_changed_flag or duration_changed_flag or not has_existing_title or not current_meta.vlm_analysis):
+                                current_meta.last_kickstart = time.time()
+                                meta_mgr.update(player_name, current_meta)
+                                await kickstart_metadata(entity_id)
+                            else:
+                                _start_watchdog_loop(entity_id, player_name)
+                        elif fresh_state.state in ("paused", "idle"):
+                            cam_obj = hass.data[DOMAIN][entry.entry_id].get("cameras", {}).get(player_name)
+                            if cam_obj:
+                                img_bytes = await cam_obj.async_camera_image()
+                                if img_bytes:
+                                    has_prog = await _check_for_progress_bar(hass, entry, player_name, img_bytes)
+                                    if has_prog:
+                                        if current_meta.title in ("Browsing...", "Loading Info...", "Unknown", "", None):
+                                            result = await _single_frame_analysis(hass, entry, player_name, img_bytes, False)
+                                            if result and result.get("title") != "Browsing...":
+                                                await _apply_consensus_to_ui(hass, entry, player_name, result)
+                                    else:
+                                        await _apply_consensus_to_ui(hass, entry, player_name, {"title": "Browsing..."})
 
-    if not hass.services.has_service(DOMAIN, "process_test_image"):
-        async def handle_process_test_image(call: ServiceCall):
-            target_entities = call.data.get("entity_id", [])
-            if not target_entities:
-                return
-            
-            target_entity_id = target_entities[0] if isinstance(target_entities, list) else target_entities
-            image_path = call.data["image_path"]
+                    except asyncio.CancelledError: pass
+                    finally: _pending_settle_tasks.pop(entity_id, None)
 
-            if not await hass.async_add_executor_job(os.path.exists, image_path):
-                return
+                _pending_settle_tasks[entity_id] = hass.async_create_task(_settle_and_trigger(duration_changed_flag=duration_changed, metadata_changed_flag=metadata_changed))
 
-            target_player_name = None
-            target_entry_id = None
-            
-            for entry_id, storage_bucket in hass.data[DOMAIN].items():
-                for p_name, p_obj in storage_bucket.get("players", {}).items():
-                    if p_obj.entity_id == target_entity_id:
-                        target_player_name = p_name
-                        target_entry_id = entry_id
-                        break
-                if target_player_name:
+        # Call the async handler we defined above
+        if entity_id in _pending_state_handlers:
+            _pending_state_handlers[entity_id].cancel()
+        _pending_state_handlers[entity_id] = hass.async_create_task(_async_handle_state_change())
+
+
+
+    if tracked_media_players:
+        unsub = async_track_state_change_event(hass, tracked_media_players, _handle_streaming_state_change)
+        hass.data[DOMAIN][entry.entry_id]["unsub_listeners"].append(unsub)
+
+    ollama_url = entry.options.get("ollama_url", entry.data.get("ollama_url", "http://localhost:11434"))
+    model_name = entry.options.get("model_name", entry.data.get("model_name", "qwen3.5-vl:2b"))
+    if ollama_url and model_name:
+        entry.async_create_background_task(hass, async_preload_ollama_model(hass, ollama_url, model_name), "ollama-preload")
+
+    async def handle_refresh_analysis(call):
+        entity_id = call.data.get("entity_id")
+        if not entity_id: return
+        player_name = entity_to_player_name_map.get(entity_id)
+        
+        if not player_name:
+            for name, proxy in hass.data[DOMAIN][entry.entry_id].get("players", {}).items():
+                if proxy.entity_id == entity_id:
+                    player_name = name
+                    entity_id = hass.data[DOMAIN][entry.entry_id].get("player_to_source", {}).get(name)
                     break
 
-            if not target_player_name:
-                return
+        if player_name and entity_id:
+            _LOGGER.info("Manual refresh requested for %s", player_name)
+            hass.data[DOMAIN][entry.entry_id]["sports_mgr"].stop_tracking(player_name)
+            _start_watchdog_loop(entity_id, player_name, force_full_parse=True)
 
-            config_entry = hass.config_entries.async_get_entry(target_entry_id)
-            if not config_entry:
-                return
+    async def handle_follow_me(call):
+        source_entity_id = call.data.get("entity_id")
+        target_receivers = call.data.get("target_receivers", [])
+        if not source_entity_id or not target_receivers: return
+        if isinstance(source_entity_id, list): source_entity_id = source_entity_id[0]
+        if isinstance(target_receivers, str): target_receivers = [target_receivers]
+        
+        player_name = entity_to_player_name_map.get(source_entity_id)
+        if not player_name:
+            for name, proxy in hass.data[DOMAIN][entry.entry_id].get("players", {}).items():
+                if proxy.entity_id == source_entity_id:
+                    player_name = name
+                    break
+                    
+        if player_name:
+            _LOGGER.info("Follow Me requested from %s to %s", player_name, target_receivers)
+            from .managers.routing_manager import RoutingManager
+            await RoutingManager.cast_stream(hass, entry, player_name, target_receivers)
 
-            def _read_image():
-                with open(image_path, "rb") as f:
-                    return f.read()
-            
-            image_bytes = await hass.async_add_executor_job(_read_image)
-            await async_analyze_frame_internal(hass, config_entry, target_player_name, image_bytes)
-
-        hass.services.async_register(DOMAIN, "process_test_image", handle_process_test_image, schema=PROCESS_IMAGE_SCHEMA)
-    
-        # Extract the connection configuration from the entry
-        ollama_url = entry.data.get("ollama_url") or entry.options.get("ollama_url")
-        model_name = entry.data.get("model_name") or entry.options.get("model_name")
-
-        # Set up your platforms, local services, etc.
-        # ...
-
-        # Fire the primer call in the background using the extracted strings
-        if ollama_url and model_name:
-            entry.async_create_background_task(
-                hass,
-                async_preload_ollama_model(hass, ollama_url, model_name),
-                "ollama-model-preload"
-            )
+    hass.services.async_register(DOMAIN, "refresh_analysis", handle_refresh_analysis)
+    hass.services.async_register(DOMAIN, "follow_me", handle_follow_me)
 
     return True
 
-async def async_preload_ollama_model(hass: HomeAssistant, ollama_url: str, model_name: str):
-    """Warm up the Ollama server by pre-loading the selected model into VRAM."""
-    session = async_get_clientsession(hass)
-    endpoint_url = f"{ollama_url.rstrip('/')}/api/generate"
+def _is_drastic_score_change(old_state: dict, new_state: dict) -> bool:
+    if not old_state or not new_state: return False
     
-    payload = {
-        "model": str(model_name),
-        "prompt": "",  # Empty prompt tells Ollama to just load the model
-        "stream": False
-    }
-    
-    _LOGGER.info("Pre-loading Ollama model into VRAM: %s", model_name)
-    try:
-        # Give it a generous timeout since VRAM allocation can take a moment
-        async with asyncio.timeout(30):
-            async with session.post(endpoint_url, json=payload) as response:
-                if response.status == 200:
-                    _LOGGER.info("Ollama model %s successfully loaded into VRAM.", model_name)
-                else:
-                    _LOGGER.warning("Ollama primer call returned status: %d", response.status)
-    except Exception as err:
-        _LOGGER.warning("Failed to pre-load Ollama model on startup: %s", err)
+    old_sets = old_state.get("tennis_sets")
+    new_sets = new_state.get("tennis_sets")
+    if isinstance(old_sets, list) and isinstance(new_sets, list):
+        if len(new_sets) < len(old_sets): return True
+        if old_sets and new_sets:
+            old_last = old_sets[-1]
+            new_last = new_sets[-1]
+            if isinstance(old_last, dict) and isinstance(new_last, dict):
+                old_total = old_last.get("competitor_a", 0) + old_last.get("competitor_b", 0)
+                new_total = new_last.get("competitor_a", 0) + new_last.get("competitor_b", 0)
+                if old_total - new_total >= 2:
+                    return True
 
-async def async_analyze_frame_internal(hass: HomeAssistant, entry: ConfigEntry, player_name: str, image_bytes: bytes):
-    """Core VLM visual analysis using direct raw HTTP posting to bypass library serialization bugs."""
-    artwork_manager = hass.data[DOMAIN][entry.entry_id]["artwork_manager"]
-    
-    ollama_url = entry.options.get("ollama_url", entry.data.get("ollama_url", "http://localhost:11434"))
-    model_name = entry.options.get("model_name", entry.data.get("model_name", "qwen3-vl:2b"))
+    old_period = old_state.get("period")
+    new_period = new_state.get("period")
+    if old_period and new_period and str(old_period).isdigit() and str(new_period).isdigit():
+        if int(new_period) < int(old_period): return True
+            
+    return False
 
-    if not image_bytes:
-        _LOGGER.error("Camera image capture returned an empty binary array for %s.", player_name)
-        return
-
-    if is_blank_or_black_image(image_bytes):
-        _LOGGER.debug("Blank or black frame detected for %s. Setting state to idle.", player_name)
-        metadata_bucket = hass.data[DOMAIN][entry.entry_id]["metadata"]
-        metadata_bucket[player_name] = {
-            "title": "System Standby",
-            "state": "idle",
-            "entity_picture": None,
-            "extra_attributes": {}
-        }
-        
-        players = hass.data[DOMAIN][entry.entry_id].get("players", {})
-        player_obj = players.get(player_name)
-        if player_obj:
-            player_obj.async_write_ha_state()
-        return
-
-    if is_likely_commercial(image_bytes):
-        _LOGGER.info("High-entropy frame detected for %s. Likely a commercial break. Skipping VLM round-trip.", player_name)
-        metadata_bucket = hass.data[DOMAIN][entry.entry_id]["metadata"]
-        current_meta = metadata_bucket.get(player_name, {})
-        metadata_bucket[player_name] = {
-            "title": current_meta.get("title", "Commercial Break"),
-            "state": "playing",
-            "entity_picture": current_meta.get("entity_picture"),
-            "extra_attributes": {
-                **current_meta.get("extra_attributes", {}),
-                "is_commercial": True
-            }
-        }
-        players = hass.data[DOMAIN][entry.entry_id].get("players", {})
-        player_obj = players.get(player_name)
-        if player_obj:
-            player_obj.async_write_ha_state()
-        return
-
-    _LOGGER.info("Starting raw HTTP VLM round-trip for %s using %s", player_name, model_name)
+async def async_watchdog_loop(hass: HomeAssistant, entry: ConfigEntry, entity_id: str, player_name: str, cam_obj, force_full_parse_next: bool = False):
+    _LOGGER.info("AI Media Tracker: Starting Adaptive Watchdog Loop for %s", player_name)
+    rolling_cache = deque(maxlen=5)
+    current_consensus_str = None
+    polls_taken = 0
+    fast_poll_limit = 3      
+    fast_poll_interval = 30  
+    slow_poll_interval = 120 
 
     try:
-        from PIL import Image
-        
-        def optimize_image_for_vlm(raw_bytes: bytes):
-            try:
-                img = Image.open(io.BytesIO(raw_bytes)).convert("RGB")
-                w, h = img.size
+        while True:
+            state = hass.states.get(entity_id)
+            if not state or state.state in ("off", "standby", "unavailable", "idle"):
+                hass.data[DOMAIN][entry.entry_id]["sports_mgr"].stop_tracking(player_name)
+                break
                 
-                # 1. Full Frame Context (Resized to fit top of composite)
-                full_frame = img.resize((1024, int(1024 * (h/w))), Image.Resampling.LANCZOS)
+            if state.state == "paused":
+                await asyncio.sleep(2)
+                continue
+
+            img_bytes = await cam_obj.async_camera_image()
+            if img_bytes:
+                result = await _single_frame_analysis(hass, entry, player_name, img_bytes, force_full_parse_next)
+                force_full_parse_next = False
                 
-                # 2. Detail Strips (Capturing logos/bugs at higher relative resolution)
-                # We take the top 15% and bottom 15% of the original image
-                top_strip = img.crop((0, 0, w, int(h * 0.15)))
-                bottom_strip = img.crop((0, int(h * 0.85), w, h))
-                
-                # Resize strips to match the width of our context frame
-                top_strip = top_strip.resize((1024, int(1024 * (top_strip.height / top_strip.width))), Image.Resampling.LANCZOS)
-                bottom_strip = bottom_strip.resize((1024, int(1024 * (bottom_strip.height / bottom_strip.width))), Image.Resampling.LANCZOS)
-
-                # 3. Create Vertical Composite
-                # Total height = Full Frame + Top Detail + Bottom Detail
-                total_h = full_frame.height + top_strip.height + bottom_strip.height
-                composite = Image.new("RGB", (1024, total_h))
-                
-                composite.paste(full_frame, (0, 0))
-                composite.paste(top_strip, (0, full_frame.height))
-                composite.paste(bottom_strip, (0, full_frame.height + top_strip.height))
-
-                output = io.BytesIO()
-                composite.save(output, format="JPEG", quality=80)
-                output.seek(0)
-                return output.getvalue()
-            except Exception as image_err:
-                _LOGGER.error("Pillow optimization failed: %s", image_err)
-                return raw_bytes
-
-        optimized_bytes = await hass.async_add_executor_job(optimize_image_for_vlm, image_bytes)
-
-        # Explicitly encode the image bytes to a clean base64 string
-        b64_image = base64.b64encode(optimized_bytes).decode("utf-8")
-
-        raw_prompt_template = """<image>
-Analyze this image, which is a vertical composite of a TV screen:
-- The TOP portion is the FULL FRAME for overall scene context.
-- The MIDDLE and BOTTOM portions are high-resolution DETAIL STRIPS of the top and bottom margins (where logos, score bugs, and tickers live). Ignore tickers and upcoming content promotions.
-
-Identify the media content (Movie, Show, or Sport) and the channel or platform. If it is a sports event, identify the teams and league. Ignore tickers and scrolls.
-
-Output ONLY a JSON object that strictly follows this schema. Do not include markdown code blocks or conversational text.
-
-Example format:
-{
-  "title": "Lakers vs Celtics",
-  "extra_attributes": {
-    "content_type": "sports",
-    "channel_platform_name": "ESPN",
-    "sport": "basketball",
-    "league": "nba",
-    "news_segment": "weather report",
-    "episode": "S5 E6 Through the Heavens Fall",
-    "is_commercial": "boolean: true if this frame appears to be an advertisement"
-  }
-}
-
-JSON Output:"""
-
-        # Perform explicit string swapping instead of dynamic evaluation blocks
-        prompt = raw_prompt_template.replace("MODEL_NAME_PLACEHOLDER", str(model_name))
-
-        # Construct the exact JSON payload the Ollama Go server expects natively
-        payload = {
-            "model": str(model_name),
-            "prompt": prompt,
-            "images": [b64_image],
-            "stream": False,
-            "thinking": False,
-            "format": "json",  # Enforce structural grammar syntax tracking
-            "options": {
-                "temperature": 0.0,
-                "num_ctx": 256000,
-                "num_predict": 12000
-            }
-        }
-
-        # Use Home Assistant's native aiohttp client session helper
-        session = async_get_clientsession(hass)
-        endpoint_url = f"{ollama_url.rstrip('/')}/api/generate"
-
-        async with asyncio.timeout(60):
-            async with session.post(endpoint_url, json=payload) as response:
-                if response.status != 200:
-                    _LOGGER.error("Ollama server returned bad HTTP status code: %d", response.status)
-                    return
+                if result:
+                    res_str = json.dumps(result, sort_keys=True)
+                    rolling_cache.append(res_str)
                     
-                result_json = await response.json()
-                
-                # Extract standard response text
-                raw_text = result_json.get("response", "").strip()
-                
-                # FALLBACK: If standard response is empty, check if the model wrote the JSON inside the thinking block
-                if not raw_text and "thinking" in result_json:
-                    _LOGGER.debug("Ollama standard response empty; falling back to thinking block data.")
-                    raw_text = result_json.get("thinking", "").strip()
-                
-                # CRITICAL DIAGNOSTIC FALLBACK: Trace the engine map if *both* are completely missing
-                if not raw_text:
-                    _LOGGER.warning("Ollama API hit returned absolutely no text data in response or thinking. Full payload: %s", json.dumps(result_json))
+                    vote_counts = Counter(rolling_cache)
+                    top_vote_str, count = vote_counts.most_common(1)[0]
+                    
+                    is_sport = bool(result.get("sports_info", {}).get("sport"))
+                    
+                    if top_vote_str != current_consensus_str and count >= (2 if len(rolling_cache) >= 3 and not is_sport else 1):
+                        
+                        if is_sport and current_consensus_str:
+                            old_game_state = json.loads(current_consensus_str).get("sports_info", {}).get("game_state", {})
+                            new_game_state = json.loads(top_vote_str).get("sports_info", {}).get("game_state", {})
+                            if _is_drastic_score_change(old_game_state, new_game_state):
+                                _LOGGER.info("Drastic score change detected for %s. Forcing full parse on next poll.", player_name)
+                                force_full_parse_next = True
+                        
+                        _LOGGER.info("New consensus reached for %s: %s", player_name, top_vote_str)
+                        current_consensus_str = top_vote_str
+                        try:
+                            await _apply_consensus_to_ui(hass, entry, player_name, json.loads(top_vote_str))
+                        except Exception as e:
+                            import traceback
+                            _LOGGER.error("CRASH in _apply_consensus_to_ui for %s: %s\n%s", player_name, e, traceback.format_exc())
+                        
+            polls_taken += 1
+            
+            is_sport_consensus = False
+            if current_consensus_str:
+                try:
+                    is_sport_consensus = bool(json.loads(current_consensus_str).get("sports_info", {}).get("sport"))
+                except: pass
 
-        if not raw_text:
-            return
+            if is_sport_consensus:
+                await asyncio.sleep(20)
+            else:
+                await asyncio.sleep(fast_poll_interval if polls_taken < fast_poll_limit else slow_poll_interval)
+                
+    except asyncio.CancelledError:
+        _LOGGER.info("Adaptive Watchdog Loop for %s cancelled.", player_name)
 
-        # Clean up JSON wrappers if the model injected them despite instructions
-        if "```json" in raw_text:
-            raw_text = raw_text.split("```json")[1].split("```")[0].strip()
-        elif "```" in raw_text:
-            raw_text = raw_text.split("```")[1].split("```")[0].strip()
-        elif "{" in raw_text:
-            raw_text = raw_text[raw_text.find("{"):raw_text.rfind("}") + 1].strip()
-
-        parsed_payload = json.loads(raw_text)
-        if not parsed_payload:
-            return
-        title_detected = parsed_payload.get("title", "Unknown")
-        extra_attrs = parsed_payload.get("extra_attributes", {})
+async def _apply_consensus_to_ui(hass, entry, player_name, vlm_result):
+    data = hass.data[DOMAIN][entry.entry_id]
+    source_entity_id = data.get("player_to_source", {}).get(player_name, f"media_player.{player_name.lower().replace(' ', '_')}")
+    native_state_raw = hass.states.get(source_entity_id)
+    native_state = extract_native_state(native_state_raw)
+    
+    if vlm_result and vlm_result.get("sports_info") and "show_info" not in vlm_result:
+        player_obj = data.get("players", {}).get(player_name)
+        if player_obj and player_obj.media_title:
+            vlm_result["show_info"] = {"episode": [player_obj.media_title]}
+            if player_obj.media_series_title:
+                vlm_result["show_info"]["title"] = player_obj.media_series_title
+    
+    resolved_data = await resolve_media(native_state, vlm_result)
+    if not resolved_data:
+        resolved_data = {}
         
-        sport = extra_attrs.get("sport", "")
-        league = extra_attrs.get("league", "")
-        app_name = extra_attrs.get("app_name") or extra_attrs.get("channel_platform_name", "")
-        _LOGGER.debug("VLM detected channel or platform as: %s", app_name or "")
+    if not resolved_data.get("title") and not resolved_data.get("series_title") and not resolved_data.get("sport"):
+        # If VLM failed and there's no native title, clear "Loading Info..."
+        resolved_data["title"] = "Unknown"
 
-        # Provide safe string defaults if any variables are None
-        safe_title = str(title_detected or "Unknown")
-        safe_app = str(app_name or "")
-        safe_sport = str(sport or "")
-        safe_league = str(league or "")
+    if resolved_data.get("title") or resolved_data.get("series_title") or resolved_data.get("sport"):
+        title = resolved_data.get("title")
+        if title not in ("Unknown", "Browsing..."):
+            if native_state_raw and native_state_raw.state == "paused":
+                resolved_data["state"] = "paused"
+            else:
+                resolved_data["state"] = "playing"
+        elif title == "Browsing...":
+            resolved_data["state"] = "paused"
+    elif "state" not in resolved_data and native_state_raw:
+        resolved_data["state"] = native_state_raw.state
 
-        _LOGGER.debug("Requesting artwork for title='%s', channel='%s'", safe_title, safe_app)
-        assets = await artwork_manager.async_get_artwork(
-            safe_title, 
-            channel_name=safe_app, 
-            sport=safe_sport, 
-            league=safe_league
+    if "extra_attributes" not in resolved_data:
+        resolved_data["extra_attributes"] = {}
+
+    is_sport = bool(resolved_data.get("sport") and resolved_data.get("league"))
+    vlm_sports = resolved_data.get("extra_attributes", {}).get("sports_info", {})
+    competitors = vlm_sports.get("competitors", [])
+
+    if is_sport:
+        data["sports_mgr"].start_tracking(
+            player_name, 
+            resolved_data.get("sport"), 
+            resolved_data.get("league"), 
+            resolved_data.get("title"),
+            competitors,
+            vlm_sports.get("game_state", {})
         )
-        _LOGGER.debug("Artwork resolved to assets: %s", assets)
-
-        state_to_set = "playing"
-        cameras = hass.data[DOMAIN][entry.entry_id].get("cameras", {})
-        cam_obj = cameras.get(player_name)
-        if cam_obj:
-            device_id = cam_obj._dev_config.get("device_id")
-            if device_id:
-                entity_reg = er.async_get(hass)
-                entries = er.async_entries_for_device(entity_reg, device_id)
-                parent_media_player = next((e.entity_id for e in entries if e.domain == "media_player"), None)
-                if parent_media_player:
-                    p_state = hass.states.get(parent_media_player)
-                    if p_state and p_state.state == "paused":
-                        state_to_set = "paused"
-
-        metadata_bucket = hass.data[DOMAIN][entry.entry_id]["metadata"]
-        metadata_bucket[player_name] = {
-            "title": title_detected,
-            "state": state_to_set,
-            "entity_picture": assets.get("poster"),
-            "extra_attributes": {
-                **extra_attrs,
-                "logo_url": assets.get("logo")
-            }
-        }
-
-        players = hass.data[DOMAIN][entry.entry_id].get("players", {})
-        player_obj = players.get(player_name)
+    else:
+        if data["sports_mgr"]._tracked_events.get(player_name):
+            # We were tracking a sport, it ended (frozen), and the VLM no longer sees a scorebug
+            # (e.g. post-game show on same channel). DO NOT clear the UI!
+            resolved_data["title"] = data["players"].get(player_name).media_title or ""
+            return
+            
+        data["sports_mgr"].stop_tracking(player_name)
+        
+        player_obj = data["players"].get(player_name)
+        should_clear = True
+        
         if player_obj:
-            player_obj.async_write_ha_state()
-            _LOGGER.info("Successfully pushed VLM metrics downstream to %s", player_obj.entity_id)
+            new_title = resolved_data.get("title", "")
+            new_series = resolved_data.get("series_title", "")
+            old_title = player_obj.media_title or ""
+            old_series = player_obj.media_series_title or ""
+            
+            if new_title.lower() in ["commercial", "advertisement", "ad", "commercials"]:
+                should_clear = False
+            elif new_title == old_title and new_series == old_series:
+                should_clear = False
+                
+        if should_clear:
+            data["sports_mgr"].clear_sports_data(player_name)
+        search_title = resolved_data.get("series_title") or resolved_data.get("title", "")
+        rich_metadata = await data["meta_hydrator"].hydrate(search_title)
+        if rich_metadata:
+            if "show_info" not in resolved_data["extra_attributes"]:
+                resolved_data["extra_attributes"]["show_info"] = {}
+            for k, v in rich_metadata.items():
+                resolved_data["extra_attributes"]["show_info"][k] = v
+                
+            if net_name := rich_metadata.get("network_name"):
+                resolved_data["extra_attributes"]["network_name"] = net_name
 
-    except json.JSONDecodeError as jde:
-        _LOGGER.error("Model failed to output parseable JSON format. Error: %s. Raw response text was: %s", jde, raw_text)
-    except Exception as exc:
-        _LOGGER.exception("Critical error processing frame via raw HTTP handler: %s", exc)
+    # Guardrail evaluation
+    if "guardrail_mgr" in data:
+        violation_tag = data["guardrail_mgr"].evaluate(player_name, resolved_data)
+        if violation_tag:
+            _LOGGER.warning("Content Guardrail Violation for %s! Tag: %s", player_name, violation_tag)
+            
+            source_entity_id = data.get("player_to_source", {}).get(player_name)
+            if source_entity_id:
+                hass.async_create_task(
+                    hass.services.async_call("media_player", "media_pause", {"entity_id": source_entity_id}, blocking=False)
+                )
+            
+            hass.bus.async_fire("ai_media_tracker_guardrail_violation", {
+                "player_name": player_name,
+                "entity_id": source_entity_id,
+                "violation_tag": violation_tag,
+                "title": resolved_data.get("title", ""),
+                "series_title": resolved_data.get("series_title", "")
+            })
+            
+            resolved_data["title"] = "Restricted Content Blocked"
+            resolved_data["series_title"] = ""
+
+    search_title = resolved_data.get("series_title") or resolved_data.get("title", "")
+    assets = await data["artwork_mgr"].async_get_artwork(
+        media_title=search_title,
+        channel_name=resolved_data.get("channel_platform_name") or resolved_data.get("extra_attributes", {}).get("network_name", "") or resolved_data.get("app_name", ""),
+        sport=resolved_data.get("sport", ""),
+        league=resolved_data.get("league", ""),
+        competitors=competitors
+    )
+    resolved_data.update({"entity_picture": assets.get("poster"), "logo_url": assets.get("logo")})
+    
+    if "sports_data" in assets:
+        resolved_data["sports_data"] = assets["sports_data"]
+    
+    _LOGGER.info("Resolved data before merge for %s: %s", player_name, resolved_data)
+    data["metadata_mgr"].merge(player_name, resolved_data)
+    if player_obj := data["players"].get(player_name):
+        player_obj.async_write_ha_state()
+
+async def _check_for_progress_bar(hass, entry, player_name, image_bytes) -> bool:
+    def _crop_progress_bar(img_bytes):
+        from PIL import Image
+        import io
+        import base64
+        img = Image.open(io.BytesIO(img_bytes))
+        width, height = img.size
+        # Crop to the bottom 33%
+        cropped = img.crop((0, int(height * 0.66), width, height))
+        buf = io.BytesIO()
+        cropped.save(buf, format="JPEG")
+        return base64.b64encode(buf.getvalue()).decode('utf-8')
+
+    try:
+        b64_image = await hass.async_add_executor_job(_crop_progress_bar, image_bytes)
+    except Exception as e:
+        _LOGGER.error("Failed to crop image for progress bar check: %s", e)
+        return False
+        
+    ollama_url = entry.options.get("ollama_url", entry.data.get("ollama_url", "http://localhost:11434"))
+    model_name = entry.options.get("model_name", entry.data.get("model_name", "qwen3.5-vl:4b"))
+    
+    prompt = "Does this image contain a video progress bar or scrubber timeline? Reply strictly with a JSON object: {\"has_progress_bar\": true} or {\"has_progress_bar\": false}"
+            
+    _LOGGER.info("Requesting VLM analysis with prompt: %s", prompt)
+
+    try:
+        async with asyncio.timeout(10):
+            session = async_get_clientsession(hass)
+            response = await session.post(f"{ollama_url}/api/generate", json={"model": model_name, "prompt": prompt, "images": [b64_image], "stream": False, "format": "json"})
+            if response.status == 200:
+                res_text = await response.text()
+                res_json = json.loads(res_text)
+                reply = res_json.get("response", "").strip() or res_json.get("thinking", "").strip()
+                if "`" in reply: 
+                    reply = re.sub(r"`{3}(?:json)?", "", reply).strip()
+                match = re.search(r"\{.*\}", reply, re.DOTALL)
+                if match:
+                    result = json.loads(match.group(0))
+                    _LOGGER.info("VLM response: %s", res_text)
+                    return result.get("has_progress_bar", False)
+    except Exception as e:
+        _LOGGER.error("Progress bar check failed for %s: %s", player_name, e)
+    return False
+
+async def _single_frame_analysis(hass, entry, player_name, image_bytes, force_full_parse=False) -> dict:
+    ollama_url = entry.options.get("ollama_url", entry.data.get("ollama_url", "http://localhost:11434"))
+    model_name = entry.options.get("model_name", entry.data.get("model_name", "qwen3.5-vl:4b"))
+
+    try:
+        optimized_bytes = await hass.async_add_executor_job(optimize_image_for_vlm, image_bytes)
+        b64_image = base64.b64encode(optimized_bytes).decode('utf-8')
+    except Exception as e:
+        _LOGGER.error("Image optimization failed for %s: %s", player_name, e)
+        return {}
+
+    data = hass.data[DOMAIN][entry.entry_id]
+    source_entity_id = data.get("player_to_source", {}).get(player_name, f"media_player.{player_name.lower().replace(' ', '_')}")
+    native_state_raw = hass.states.get(source_entity_id)
+    native_state = extract_native_state(native_state_raw) or {}
+    
+    native_title = native_state.get("title", "")
+    native_app = (native_state.get("app_name") or "").lower().strip()
+    
+    is_sports = is_sport_title(native_title)
+    live_tv_apps = {"directv", "directv stream", "youtube tv", "hulu", "fubo", "sling"}
+    generic_inputs = {"hdmi 1", "hdmi 2", "hdmi 3", "hdmi 4", "hdmi1", "hdmi2", "hdmi3", "hdmi4", "live tv", "tv", "input", "antenna", "cable", "satellite", "unknown"}
+    is_live_tv = (native_app in live_tv_apps or native_app in generic_inputs) and not is_sports
+    
+    active_sports_task = data.get("sports_mgr")._tracked_events.get(player_name) if "sports_mgr" in data else None
+    if force_full_parse:
+        active_sports_task = None
+
+    context_msgs = []
+    if native_title:
+        context_msgs.append(f"Title: '{native_title}'")
+    if native_app:
+        context_msgs.append(f"App/Input: '{native_app}'")
+    context_str = ""
+    if context_msgs:
+        context_str = "The Apple TV reports the following native state (this may be inaccurate or stale, please verify using the image):\n- " + "\n- ".join(context_msgs) + "\n\n"
+
+    for attempt in range(2):
+        if active_sports_task:
+            tracked_sport_slug = active_sports_task[0]
+            prompt = (
+                f"Analyze this video frame from a live {tracked_sport_slug} broadcast.\n"
+                "ONLY extract the live game score and state from the scorebug. Do NOT extract team names or tournament info.\n\n"
+                "### CRITICAL INSTRUCTION:\n"
+            )
+            if tracked_sport_slug == "tennis":
+                prompt += "1. For TENNIS: Carefully read the score bug. The current game score (e.g. 15, 30, 40, AD, or tiebreak points like 4, 5, 6) is completely separate and usually on the far right. NEVER combine the game score or tiebreak points with the set scores. Look for a serving indicator (a dot or tennis ball icon) next to a player's name. Extract ALL sets played so far in chronological order.\n"
+                schema_game_state = "      \"tennis_sets\": [{\"competitor_a\": 6, \"competitor_b\": 4}, {\"competitor_a\": 1, \"competitor_b\": 2}],\n      \"tennis_game\": \"30-40 or null\",\n      \"server\": \"name of serving player or null\""
+            elif tracked_sport_slug == "baseball":
+                prompt += "1. For BASEBALL: Extract inning (e.g., 'Top 4th'), outs, balls, strikes, and runners on base (on_first, on_second, on_third as true/false) from the scorebug.\n"
+                schema_game_state = "      \"inning\": \"Top 4th or null\",\n      \"outs\": \"2 or null\",\n      \"balls\": \"3 or null\",\n      \"strikes\": \"2 or null\",\n      \"on_first\": true,\n      \"on_second\": false,\n      \"on_third\": false"
+            elif tracked_sport_slug == "basketball":
+                prompt += "1. For BASKETBALL: Extract quarter (period) and game clock (e.g. 10:24) from the scorebug.\n"
+                schema_game_state = "      \"period\": \"3 or null\",\n      \"clock\": \"10:24 or null\""
+            elif tracked_sport_slug == "football":
+                prompt += "1. For FOOTBALL: Extract quarter (period), game clock, down, distance (e.g. '3rd & 4'), and possession.\n"
+                schema_game_state = "      \"period\": \"3 or null\",\n      \"clock\": \"10:24 or null\",\n      \"down\": \"3 or null\",\n      \"distance\": \"4 or null\",\n      \"possession\": \"team name or null\""
+            elif tracked_sport_slug == "soccer":
+                prompt += "1. For SOCCER: Extract half (period) and game clock (e.g. 45:00) from the scorebug.\n"
+                schema_game_state = "      \"period\": \"2 or null\",\n      \"clock\": \"45:00 or null\""
+            elif tracked_sport_slug == "hockey":
+                prompt += "1. For HOCKEY: Extract period and game clock (e.g. 10:24) from the scorebug.\n"
+                schema_game_state = "      \"period\": \"3 or null\",\n      \"clock\": \"10:24 or null\""
+            elif tracked_sport_slug == "golf":
+                prompt += "1. For GOLF: Extract the current hole.\n"
+                schema_game_state = "      \"hole\": \"14 or null\""
+            else:
+                prompt += "1. Extract any visible game state metrics from the score bug.\n"
+                schema_game_state = "      \"clock\": \"10:24 or null\",\n      \"period\": \"3 or null\",\n      \"inning\": \"Top 4th or null\",\n      \"outs\": \"2 or null\",\n      \"count\": \"3-2 or null\",\n      \"hole\": \"14 or null\""
+                
+            prompt += (
+                "Output JSON ONLY using this exact structure:\n"
+                "{\n"
+                "  \"sports_info\": {\n"
+                f"    \"sport\": \"{tracked_sport_slug} if a scorebug is visible, otherwise null\",\n"
+                f"    \"league\": \"{active_sports_task[1]}\",\n"
+                "    \"game_state\": {\n"
+f"{schema_game_state}\n"
+                "    }\n"
+                "  }\n"
+                "}"
+            )
+        elif is_sports:
+            prompt = (
+                f"Analyze this video frame from a sports broadcast and return a strict JSON object.\n\n{context_str}"
+                "### CRITICAL INSTRUCTION:\n"
+                "1. Identify the sport and league (e.g., 'tennis' and 'atp', or 'basketball' and 'nba').\n"
+                "2. Identify the Tournament Name or Event Name.\n"
+                "3. Identify the Venue or Stadium name if visible.\n"
+                "4. For team sports, set 'show_info.episode' to 'Team A vs Team B'.\n"
+                "5. For individual sports, set 'show_info.episode' to 'Player A vs Player B' or 'Tournament Name'.\n"
+                "6. For TENNIS: Carefully read the score bug. Completed sets are in the left columns, the current set is next. The current game score (e.g. 15, 30, 40, AD, or tiebreak points like 4, 5, 6) is completely separate and usually on the far right or in a separate box. NEVER combine the game score or tiebreak points with the set scores. Look for a serving indicator (a dot or tennis ball icon) next to a player's name.\n"
+                "7. Extract any visible game state metrics from the score bug. For tennis, extract ALL sets played so far in chronological order.\n\n"
+                "Output JSON ONLY using this exact structure:\n"
+                "{\n"
+                "  \"sports_info\": {\n"
+                "    \"sport\": \"sport name or null\",\n"
+                "    \"league\": \"league name or null\",\n"
+                "    \"tournament\": \"tournament name or null\",\n"
+                "    \"venue\": \"venue name or null\",\n"
+                "    \"game_state\": {\n"
+                "      \"clock\": \"10:24 or null\",\n"
+                "      \"period\": \"3 or null\",\n"
+                "      \"inning\": \"Top 4th or null\",\n"
+                "      \"outs\": \"2 or null\",\n"
+                "      \"count\": \"3-2 or null\",\n"
+                "      \"hole\": \"14 or null\",\n"
+                "      \"tennis_sets\": [{\"competitor_a\": 6, \"competitor_b\": 4}, {\"competitor_a\": 1, \"competitor_b\": 2}],\n"
+                "      \"tennis_game\": \"30-40 or null\",\n"
+                "      \"server\": \"name of serving player or null\"\n"
+                "    },\n"
+                "    \"competitors\": [\n"
+                "      {\"name\": \"Competitor A\"},\n"
+                "      {\"name\": \"Competitor B\"}\n"
+                "    ]\n"
+                "  },\n"
+                "  \"show_info\": {\n"
+                "    \"episode\": [\"Team A vs Team B\"]\n"
+                "  }\n"
+                "}"
+            )
+        elif is_live_tv:
+            prompt = (
+                f"Analyze this video frame from a live TV broadcast and return a strict JSON object.\n\n{context_str}"
+                "### CRITICAL INSTRUCTION:\n"
+                "1. If the image shows the main Apple TV home screen (a grid of app icons like Netflix, Settings, Photos, App Store, etc., with no specific media playing or highlighted), simply return 'Browsing...' as the title and output nothing else.\n"
+                "2. IMPORTANT: Check for a full-width video scrubber/timeline (usually at the absolute bottom edge of the screen, indicating current timestamp and total duration). If this full-width scrubber is visible, it means a video is actively paused. In this case, DO NOT return 'Browsing...'—proceed to identify the channel.\n"
+                "3. If there is NO full-width video scrubber (ignore small progress bars underneath episode thumbnails or 'Resume' buttons), and the screen is a menu, grid, browsing interface, or an episode/movie details screen, simply return 'Browsing...' as the title.\n"
+                "4. If it is not a menu or browsing interface, identify the TV CHANNEL or STREAMING APP from the WATERMARK LOGO usually in the bottom right or top corner.\n"
+                "5. DO NOT guess the channel if no logo or text is present.\n"
+                "6. Extract any age rating (e.g., 'TV-PG', 'TV-MA', 'PG-13') if visible.\n"
+                "7. ESCAPE HATCH: If this is actually a live sports broadcast, simply set 'is_sports_broadcast': true and return.\n\n"
+                "Output JSON ONLY using this exact structure:\n"
+                "{\n"
+                "  \"channel_platform_name\": \"Name of network or app\",\n"
+                "  \"is_sports_broadcast\": false,\n"
+                "  \"show_info\": {\n"
+                "    \"rating\": \"TV-PG\"\n"
+                "  },\n"
+                "  \"scene_analysis\": {\n"
+                "    \"mood_tags\": [\"Action\", \"Drama\"],\n"
+                "    \"visual_description\": \"Briefly describe what is happening\"\n"
+                "  }\n"
+                "}"
+            )
+        else:
+            prompt = (
+                f"Analyze this video frame from a TV show or movie and return a strict JSON object.\n\n{context_str}"
+                "### CRITICAL INSTRUCTION:\n"
+                "1. ESCAPE HATCH: If this is actually a live sports broadcast, simply set 'is_sports_broadcast': true and return.\n"
+                "2. If the image shows the main Apple TV home screen (a grid of app icons like Netflix, Settings, Photos, App Store, etc., with no specific media playing or highlighted), simply return 'Browsing...' as the title and return.\n"
+                "3. IMPORTANT: Check for a full-width video scrubber/timeline (usually at the absolute bottom edge of the screen, indicating current timestamp and total duration). If this full-width scrubber is visible, it means a video is actively paused. In this case, DO NOT return 'Browsing...'—proceed to identify the show.\n"
+                "4. If there is NO full-width video scrubber (ignore small progress bars underneath episode thumbnails or 'Resume' buttons), and the screen is a menu, grid, browsing interface, or an episode/movie details screen, simply return 'Browsing...' as the title and return.\n"
+                "5. If it is not a menu or details screen, identify the name of the specific episode if it is shown on screen (e.g., during an intro sequence).\n"
+                "6. Identify any visible actors by name.\n"
+                "7. Identify the main title of the series or movie.\n\n"
+                "Output JSON ONLY using this exact structure:\n"
+                "{\n"
+                "  \"title\": \"Name of Movie or Show\",\n"
+                "  \"is_sports_broadcast\": false,\n"
+                "  \"show_info\": {\n"
+                "    \"episode\": [\"Name of episode\"],\n"
+                "    \"actors\": [\"Actor A\", \"Actor B\"]\n"
+                "  },\n"
+                "  \"scene_analysis\": {\n"
+                "    \"mood_tags\": [\"Action\", \"Drama\"],\n"
+                "    \"visual_description\": \"Briefly describe what is happening\"\n"
+                "  }\n"
+                "}"
+            )
+            
+        _LOGGER.info("Requesting VLM analysis with prompt: %s", prompt)
+
+        try:
+            async with asyncio.timeout(60):
+                session = async_get_clientsession(hass)
+                response = await session.post(f"{ollama_url}/api/generate", json={"model": model_name, "prompt": prompt, "images": [b64_image], "stream": False, "format": "json"})
+                if response.status == 200:
+                    res_text = await response.text()
+                    try:
+                        res_json = json.loads(res_text)
+                    except json.JSONDecodeError as e:
+                        _LOGGER.error("VLM returned invalid JSON response for %s: %s", player_name, e)
+                        return {}
+
+                    reply = res_json.get("response", "").strip() or res_json.get("thinking", "").strip()
+                    if reply:
+                        if "`" in reply: 
+                            reply = re.sub(r"`{3}(?:json)?", "", reply).strip()
+                        
+                        match = re.search(r"\{.*\}", reply, re.DOTALL)
+                        if not match:
+                            _LOGGER.error("VLM response contained no valid JSON structure for %s", player_name)
+                            return {}
+                        
+                        try:
+                            result = json.loads(match.group(0))
+                        except json.JSONDecodeError as e:
+                            _LOGGER.error("Failed to decode JSON from VLM match for %s: %s", player_name, e)
+                            return {}
+                            
+                        if result.get("is_sports_broadcast") is True:
+                            _LOGGER.info("VLM detected sports broadcast on VOD app. Falling back to sports prompt.")
+                            is_sports = True
+                            continue
+                            
+                        if active_sports_task and "sports_info" not in result:
+                            game_state = result.get("game_state", result)
+                            result = {
+                                "sports_info": {
+                                    "sport": active_sports_task[0],
+                                    "league": active_sports_task[1],
+                                    "game_state": game_state
+                                }
+                            }
+
+                        if not validate_vlm_result(result):
+                            return {}
+                        
+                        _LOGGER.info("VLM response: %s", res_text)
+                        return result
+        except asyncio.TimeoutError:
+            _LOGGER.error("VLM request timed out for %s", player_name)
+        except Exception as e:
+            _LOGGER.error("VLM processing failure on %s: %s", player_name, e)
+            
+    return {}
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
-    """Unload a config entry and sweep memory footprints."""
-    unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
-    if unload_ok:
+    data = hass.data[DOMAIN].get(entry.entry_id)
+    if not data: return True
+    
+    for task in data.get("watchdogs", {}).values():
+        task.cancel()
+    for task in data.get("pending_settle_tasks", {}).values():
+        task.cancel()
+    for task in data.get("pending_state_handlers", {}).values():
+        task.cancel()
+        
+    if "sports_mgr" in data:
+        data["sports_mgr"].stop_all()
+    for unsub in data.get("unsub_listeners", []):
+        unsub()
+        
+    # Remove from hass.data to prevent memory leaks
+    result = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
+    if result:
         hass.data[DOMAIN].pop(entry.entry_id, None)
-        if not hass.data[DOMAIN] and hass.services.has_service(DOMAIN, "process_test_image"):
-            hass.services.async_remove(DOMAIN, "process_test_image")
-            
-    return unload_ok
+    return result
+
+async def async_preload_ollama_model(hass, url, model):
+    try:
+        session = async_get_clientsession(hass)
+        await session.post(f"{url}/api/generate", json={"model": model})
+    except Exception: pass
+

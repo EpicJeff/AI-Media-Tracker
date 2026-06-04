@@ -11,3 +11,19 @@ process_test_image:
       description: Complete file system path tracking where your static test show photo lives.
       required: true
       example: "/config/www/images/test_sports_match.jpg"
+follow_me:
+  name: AI Media Tracker - Follow Me
+  description: Cast the active RTSP stream from this room to any other cast-enabled receiver.
+  target:
+    entity:
+      integration: ai_media_tracker
+      domain: media_player
+  fields:
+    target_receivers:
+      name: Target Receivers
+      description: Entity ID(s) of the cast receiver(s) to send the stream to.
+      required: true
+      selector:
+        entity:
+          domain: media_player
+          multiple: true
