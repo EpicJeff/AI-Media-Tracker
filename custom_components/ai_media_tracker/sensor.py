@@ -25,7 +25,50 @@ async def async_setup_entry(hass, entry, async_add_entities):
         if room_name:
             sensors.append(ViewingHistorySensor(hass, room_name, storage_mgr))
             
+    # Add a single global NotificationSensor
+    notif_mgr = data.get("notif_mgr")
+    if notif_mgr:
+        sensors.append(NotificationSensor(hass, notif_mgr))
+            
     async_add_entities(sensors, update_before_add=True)
+
+
+class NotificationSensor(SensorEntity):
+    """Sensor that tracks global system notifications."""
+
+    def __init__(self, hass, notif_mgr):
+        self.hass = hass
+        self._notif_mgr = notif_mgr
+        
+        self._attr_unique_id = "ai_tracker_global_notifications"
+        self._attr_name = "AI Media Tracker Notifications"
+        self._attr_icon = "mdi:bell"
+        self._remove_listener = None
+
+    @property
+    def native_value(self):
+        """Return the unread notification count."""
+        return self._notif_mgr.unread_count
+
+    @property
+    def extra_state_attributes(self):
+        """Return the full list of notifications."""
+        return {
+            "notifications": self._notif_mgr.notifications
+        }
+
+    async def async_added_to_hass(self):
+        await super().async_added_to_hass()
+        
+        def _on_notif_update():
+            self.async_write_ha_state()
+
+        self._remove_listener = self._notif_mgr.register_listener(_on_notif_update)
+        
+    async def async_will_remove_from_hass(self):
+        if self._remove_listener:
+            self._remove_listener()
+        await super().async_will_remove_from_hass()
 
 
 class ViewingHistorySensor(SensorEntity):
@@ -47,6 +90,16 @@ class ViewingHistorySensor(SensorEntity):
         self._attr_state_class = "measurement"
 
     @property
+    def device_info(self):
+        slug = self._room_name.lower().replace(" ", "_")
+        return {
+            "identifiers": {(DOMAIN, slug)},
+            "name": f"AI Media Tracker - {self._room_name}",
+            "manufacturer": "Antigravity",
+            "model": "AI Media Tracker Node"
+        }
+
+    @property
     def native_value(self):
         """Return the daily watch time in minutes."""
         data = self._storage_mgr._data.get(self._room_name, {})
@@ -62,8 +115,19 @@ class ViewingHistorySensor(SensorEntity):
     def extra_state_attributes(self):
         """Return the detailed viewing history."""
         data = self._storage_mgr._data.get(self._room_name, {})
+        history = data.get("history", [])
+        
+        pruned_history = []
+        for entry in history[-20:]:
+            clean_entry = dict(entry)
+            clean_entry.pop("show_info", None)
+            clean_entry.pop("scene_analysis", None)
+            clean_entry.pop("sports_data", None)
+            clean_entry.pop("extra_attributes", None)
+            pruned_history.append(clean_entry)
+            
         return {
-            "history": data.get("history", [])
+            "history": pruned_history
         }
 
     async def async_added_to_hass(self):

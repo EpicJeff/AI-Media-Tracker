@@ -41,6 +41,7 @@ class MetadataManager:
                 "channel_platform_name", "network_name",
                 "logo_url", "entity_picture", "series_title"
             ]
+            current.last_announced_title = None
             for field in fields_to_clear:
                 default = [] if field == "teams" else {} if field in ["scene_analysis", "sports_data", "show_info"] else None
                 setattr(current, field, default)
@@ -88,5 +89,17 @@ class MetadataManager:
             "state": current.state,
             "metadata": current.__dict__
         })
+        
+        # Fire Semantic Events
+        if current.state == "playing" and current.title not in ("Browsing...", "Loading Info...", "System Standby", "Unknown", "", "Home Screen"):
+            if current.title != current.last_announced_title:
+                event_type = "ai_media_tracker_sporting_event_started" if current.sport else "ai_media_tracker_show_started"
+                current.last_announced_title = current.title
+                self.update(player_name, current)
+                
+                self.hass.bus.async_fire(event_type, {
+                    "player_name": player_name,
+                    "metadata": current.__dict__
+                })
         
         return current

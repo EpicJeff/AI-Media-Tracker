@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+
+# Device keys and API keys, never published
+.storage/
+adbkey
+adbkey.pub
+gemini_key.txt
+
+# Local test captures and benchmark output
+www/ai-media-matrix/test/
+custom_components/ai_media_tracker/dev/results/

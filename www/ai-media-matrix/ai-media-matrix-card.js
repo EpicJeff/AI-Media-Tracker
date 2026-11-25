@@ -9,7 +9,14 @@ import {
 // ============================================================================
 class AiMediaMatrixCard extends LitElement {
   static get properties() {
-    return { hass: {}, config: {}, _activeTab: { type: String }, _showCameraOverlay: { type: Boolean }, _refreshInfo: { type: Boolean }, _showCastModal: { type: Boolean }, _castSearchText: { type: String } };
+    return { hass: {}, config: {}, _activeTab: { type: String }, _showCameraOverlay: { type: Boolean }, _refreshInfo: { type: Boolean }, _showCastModal: { type: Boolean }, _showNotifModal: { type: Boolean }, _castSearchText: { type: String }, _castExpandedGroups: { type: Array }, _cameraMuted: { type: Boolean }, _cameraVolume: { type: Number } };
+  }
+
+  constructor() {
+    super();
+    this._cameraMuted = true;
+    this._cameraVolume = 0.5;
+    this._castExpandedGroups = [];
   }
 
   static async getConfigElement() {
@@ -34,6 +41,13 @@ class AiMediaMatrixCard extends LitElement {
   shouldUpdate(changedProps) {
     if (changedProps.has('_activeTab')) return true;
     if (changedProps.has('config')) return true;
+    if (changedProps.has('_showNotifModal')) return true;
+    if (changedProps.has('_showCastModal')) return true;
+    if (changedProps.has('_showCameraOverlay')) return true;
+    if (changedProps.has('_castSearchText')) return true;
+    if (changedProps.has('_castExpandedGroups')) return true;
+
+    if (this._showNotifModal || this._showCastModal || this._showCameraOverlay) return true;
 
     if (changedProps.has('hass')) {
       const oldHass = changedProps.get('hass');
@@ -43,7 +57,10 @@ class AiMediaMatrixCard extends LitElement {
       const oldState = oldHass?.states[currentRoom.entity];
       const newState = this.hass?.states[currentRoom.entity];
 
-      if (oldState !== newState) {
+      const oldNotif = oldHass?.states['sensor.ai_media_notifications'];
+      const newNotif = this.hass?.states['sensor.ai_media_notifications'];
+
+      if (oldState !== newState || oldNotif !== newNotif) {
         return true;
       }
       return false;
@@ -200,6 +217,10 @@ class AiMediaMatrixCard extends LitElement {
       }
       .live-camera-close:hover {
         background: rgba(255,0,0,0.6);
+      }
+      
+      .live-camera-popup:hover .camera-controls-overlay {
+        opacity: 1 !important;
       }
 
       .camera-toggle-icon {
@@ -782,7 +803,19 @@ class AiMediaMatrixCard extends LitElement {
     return path.split('.').reduce((acc, part) => acc && acc[part], obj) ?? fallback;
   }
 
-  _renderCanvasBackground(isPlaying, poster, sports, logoUrl, seriesTitle, title, appName, cameraUrl, cameraEntityId = null, trailerId = null) {
+  _renderCanvasBackground(isPlaying, poster, sports, logoUrl, seriesTitle, title, appName, cameraUrl, cameraEntityId = null, trailerId = null, isContentBlocked = false, violationTag = '') {
+    if (isContentBlocked) {
+      return html`
+        <div class="canvas-background" style="background-image: url('${poster || ''}'); filter: blur(20px) grayscale(80%); transform: scale(1.1);"></div>
+        <div class="canvas-overlay"></div>
+        <div style="position:absolute; top:0; left:0; width:100%; height:100%; display:flex; flex-direction:column; justify-content:center; align-items:center; z-index:5; pointer-events:none;">
+          <ha-icon icon="mdi:shield-lock" style="--mdc-icon-size: 100px; color: #e74c3c; filter: drop-shadow(0 0 20px rgba(231,76,60,0.5));"></ha-icon>
+          <div style="font-size: 3rem; font-weight: 900; color: #fff; margin-top: 20px; text-transform: uppercase; letter-spacing: 2px; text-shadow: 0 4px 10px rgba(0,0,0,0.8);">Restricted Content</div>
+          <div style="background: #e74c3c; color: #fff; padding: 8px 16px; border-radius: 20px; font-weight: bold; font-size: 1.2rem; margin-top: 15px; text-transform: uppercase; box-shadow: 0 4px 15px rgba(231,76,60,0.4);">Blocked: ${violationTag}</div>
+        </div>
+      `;
+    }
+
     if (!isPlaying) {
       return html`
         <div class="canvas-background" style="background-color: #0c0c0d;">
@@ -939,13 +972,63 @@ class AiMediaMatrixCard extends LitElement {
     }, 1000);
   }
 
+  _updateCameraVolume() {
+    setTimeout(() => {
+      const stream = this.shadowRoot.querySelector('ha-camera-stream');
+      if (!stream) return;
+      const player = stream.shadowRoot.querySelector('ha-hls-player') || stream.shadowRoot.querySelector('ha-web-rtc-player');
+      if (player) {
+        const video = player.shadowRoot.querySelector('video');
+        if (video) {
+          video.volume = this._cameraVolume;
+          video.muted = this._cameraMuted;
+        }
+      }
+    }, 50);
+  }
+
   _castStream(sourceEntity, targetReceiver) {
     if (!this.hass) return;
     this.hass.callService("ai_media_tracker", "follow_me", {
       entity_id: sourceEntity,
       target_receivers: targetReceiver
     });
-    this._showCastModal = false;
+  }
+
+  _stopCast(sourceEntity, targetReceiver) {
+    if (!this.hass) return;
+    this.hass.callService("ai_media_tracker", "stop_cast", {
+      entity_id: sourceEntity,
+      target_receivers: targetReceiver
+    });
+  }
+
+  _stopAllCasts(sourceEntity, targetReceivers) {
+    this.hass.callService("ai_media_tracker", "stop_cast", {
+      entity_id: sourceEntity,
+      target_receivers: targetReceivers
+    });
+  }
+
+  _toggleExpandedGroup(entityId) {
+    if (this._castExpandedGroups.includes(entityId)) {
+      this._castExpandedGroups = this._castExpandedGroups.filter(id => id !== entityId);
+    } else {
+      this._castExpandedGroups = [...this._castExpandedGroups, entityId];
+    }
+  }
+
+  _toggleGroupTarget(parentEntityId, childEntityId, isCurrentlyChecked) {
+    if (isCurrentlyChecked) {
+      this.hass.callService("ai_media_tracker", "ungroup_targets", {
+        child_entity_ids: [childEntityId]
+      });
+    } else {
+      this.hass.callService("ai_media_tracker", "group_targets", {
+        parent_entity_id: parentEntityId,
+        child_entity_ids: [childEntityId]
+      });
+    }
   }
 
   render() {
@@ -977,14 +1060,20 @@ class AiMediaMatrixCard extends LitElement {
     const trailerId = showInfo?.trailer_youtube_id || null;
     const cameraUrl = state?.attributes.camera_stream_url;
     const cameraEntityId = state?.attributes.camera_entity_id;
+    const isContentBlocked = state?.attributes.is_content_blocked || false;
+    const violationTag = state?.attributes.content_violation_tag || '';
     
+    const notifState = this.hass.states['sensor.ai_media_tracker_notifications'];
+    const unreadCount = notifState ? parseInt(notifState.state) || 0 : 0;
+    const notifications = notifState?.attributes?.notifications || [];
+
     var displayTitle = title;
     if(sportsData.away_team && sportsData.home_team && sportsData.is_individual === false)
     {
       displayTitle = sportsData.away_team + " vs " + sportsData.home_team;
     }
     return html`
-      ${this._renderCanvasBackground(isPlaying, poster, sportsData, logoUrl, seriesTitle, title, appName, cameraUrl, cameraEntityId, trailerId)}
+      ${this._renderCanvasBackground(isPlaying, poster, sportsData, logoUrl, seriesTitle, title, appName, cameraUrl, cameraEntityId, trailerId, isContentBlocked, violationTag)}
       
       <div class="dak-fullscreen-wrapper">
         <div class="header-row ui-layer" style="display: flex; justify-content: space-between; align-items: center; width: 100%;">
@@ -1002,9 +1091,188 @@ class AiMediaMatrixCard extends LitElement {
               </button>
             ` : html``}
             
-            <button class="refresh-btn" @click="${() => this._showCastModal = true}" title="Follow Me / Cast">
-              <ha-icon icon="mdi:cast" class="refresh-icon"></ha-icon>
-            </button>
+            <div style="position:relative;">
+              <button class="refresh-btn" @click="${() => { this._showNotifModal = !this._showNotifModal; if(this._showNotifModal && unreadCount > 0) this.hass.callService('ai_media_tracker', 'mark_notifications_read'); }}" title="Notifications">
+                <ha-icon icon="mdi:bell" class="refresh-icon" style="${unreadCount > 0 ? 'color:#e74c3c;' : ''}"></ha-icon>
+                ${unreadCount > 0 ? html`
+                  <div style="position:absolute; top:-6px; right:-6px; background:#e74c3c; color:#fff; font-size:11px; font-weight:bold; border-radius:12px; padding:2px 6px; box-shadow: 0 0 5px rgba(231, 76, 60, 0.5); pointer-events:none;">${unreadCount}</div>
+                ` : html``}
+              </button>
+
+              ${this._showNotifModal ? html`
+                <div style="position:fixed; top:0; left:0; width:100%; height:100%; z-index:10000;" @click="${(e) => { e.stopPropagation(); this._showNotifModal = false; }}"></div>
+                <div style="position:absolute; top:45px; right:0; background:rgba(30,30,30,0.95); backdrop-filter:blur(10px); border-radius:12px; width:350px; border:1px solid rgba(255,255,255,0.1); z-index:10001; box-shadow: 0 10px 30px rgba(0,0,0,0.5); display:flex; flex-direction:column; overflow:hidden;">
+                  <div style="padding:16px; border-bottom:1px solid rgba(255,255,255,0.05); display:flex; justify-content:space-between; align-items:center;">
+                    <div style="display:flex; flex-direction:column;">
+                       <span style="color:#fff; font-weight:bold; font-size:1rem;">Notifications</span>
+                    </div>
+                    <button style="background:rgba(255, 255, 255, 0.1); color:#fff; border:none; border-radius:4px; padding:4px 8px; font-size:0.75rem; cursor:pointer; transition:background 0.2s;" @click="${() => this.hass.callService('ai_media_tracker', 'clear_notification')}">Clear All</button>
+                  </div>
+                  
+                  <div style="max-height:400px; overflow-y:auto; padding:8px; display:flex; flex-direction:column; gap:8px;">
+                    ${notifications.length === 0 ? html`<div style="padding:20px; text-align:center; color:#888;">No notifications</div>` : 
+                      notifications.map(n => html`
+                        <div style="background:rgba(255,255,255,0.05); border-radius:8px; padding:12px; position:relative; display:flex; flex-direction:column; gap:8px;">
+                          <div style="display:flex; justify-content:space-between; align-items:flex-start;">
+                            <div style="display:flex; align-items:center; gap:6px; padding-right:8px;">
+                              ${n.type === 'violation' ? html`<ha-icon icon="mdi:shield-alert" style="color:#e74c3c; --mdc-icon-size:16px;"></ha-icon>` : html`<ha-icon icon="mdi:information" style="color:#3498db; --mdc-icon-size:16px;"></ha-icon>`}
+                              <span style="color:#fff; font-weight:bold; font-size:0.9rem;">${n.title}</span>
+                            </div>
+                            <div style="display:flex; align-items:center; gap:8px;">
+                              <span style="color:#888; font-size:0.7rem;">${new Date(n.timestamp).toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'})}</span>
+                              <button style="background:none; border:none; color:#888; cursor:pointer; padding:0; display:flex;" @click="${() => this.hass.callService('ai_media_tracker', 'clear_notification', { notification_id: n.id })}">
+                                <ha-icon icon="mdi:close" style="--mdc-icon-size:14px;"></ha-icon>
+                              </button>
+                            </div>
+                          </div>
+                          <span style="color:#bbb; font-size:0.85rem; line-height:1.3;">${n.message}</span>
+                          ${n.image_url ? html`<img src="${n.image_url}" style="width:100%; height:auto; border-radius:6px; margin-top:4px; border:1px solid rgba(255,255,255,0.1); object-fit:cover;" />` : html``}
+                        </div>
+                      `)
+                    }
+                  </div>
+                </div>
+              ` : html``}
+            </div>
+            
+            <div style="position:relative;">
+              <button class="refresh-btn" @click="${() => this._showCastModal = !this._showCastModal}" title="Follow Me / Cast">
+                <ha-icon icon="${state?.attributes?.active_casts && state.attributes.active_casts.length > 0 ? 'mdi:cast-connected' : 'mdi:cast'}" class="refresh-icon" style="${state?.attributes?.active_casts && state.attributes.active_casts.length > 0 ? 'color:#2ecc71;' : ''}"></ha-icon>
+                ${state?.attributes?.active_casts && state.attributes.active_casts.length > 0 ? html`
+                  <div style="position:absolute; top:-6px; right:-6px; background:#2ecc71; color:#111; font-size:11px; font-weight:bold; border-radius:12px; padding:2px 6px; box-shadow: 0 0 5px rgba(46, 204, 113, 0.5); pointer-events:none;">${state.attributes.active_casts.length}</div>
+                ` : html``}
+              </button>
+
+              ${this._showCastModal ? html`
+                <div style="position:fixed; top:0; left:0; width:100%; height:100%; z-index:10000;" @click="${(e) => { e.stopPropagation(); this._showCastModal = false; }}"></div>
+                <div style="position:absolute; top:45px; right:0; background:rgba(30,30,30,0.95); backdrop-filter:blur(10px); border-radius:12px; width:300px; border:1px solid rgba(255,255,255,0.1); z-index:10001; box-shadow: 0 10px 30px rgba(0,0,0,0.5); display:flex; flex-direction:column; overflow:hidden;">
+                  <div style="padding:16px; border-bottom:1px solid rgba(255,255,255,0.05); display:flex; flex-direction:column; gap:12px;">
+                    <div style="display:flex; justify-content:space-between; align-items:center;">
+                      <div style="display:flex; flex-direction:column;">
+                         <span style="color:#fff; font-weight:bold; font-size:1rem;">Cast Group</span>
+                         <span style="color:#aaa; font-size:0.8rem;">Select screens to sync</span>
+                      </div>
+                      ${state?.attributes?.active_casts && state.attributes.active_casts.length > 0 ? html`
+                        <button style="background:rgba(231, 76, 60, 0.2); color:#e74c3c; border:1px solid #e74c3c; border-radius:4px; padding:4px 8px; font-size:0.75rem; cursor:pointer;" @click="${() => this._stopAllCasts(currentRoom.entity, state.attributes.active_casts)}">Stop All</button>
+                      ` : html``}
+                    </div>
+                    <input type="text" placeholder="Search devices..." .value="${this._castSearchText || ''}" @input="${(e) => this._castSearchText = e.target.value}" style="width:100%; box-sizing:border-box; padding:8px 12px; border-radius:6px; border:1px solid rgba(255,255,255,0.1); background:rgba(0,0,0,0.3); color:#fff; font-family:inherit; font-size:0.9rem;">
+                  </div>
+                  
+                  <div style="max-height:350px; overflow-y:auto; padding:8px; display:flex; flex-direction:column; gap:4px;">
+                    ${(() => {
+                      const groups = state?.attributes?.target_groups || {};
+                      const allowedTargets = state?.attributes?.cast_targets || [];
+                      
+                      const allDevices = Object.values(this.hass.states).filter(s => {
+                        if (!s.entity_id.startsWith('media_player.')) return false;
+                        if (s.entity_id.startsWith('media_player.ai_media_')) return false;
+                        if (allowedTargets.length > 0 && !allowedTargets.includes(s.entity_id)) return false;
+                        return true;
+                      });
+                      
+                      const allChildren = new Set();
+                      Object.values(groups).forEach(children => children.forEach(c => allChildren.add(c)));
+                      
+                      let topLevelDevices = allDevices.filter(d => !allChildren.has(d.entity_id));
+                      topLevelDevices.sort((a, b) => {
+                        const aUnavail = a.state === 'unavailable';
+                        const bUnavail = b.state === 'unavailable';
+                        if (aUnavail && !bUnavail) return 1;
+                        if (!aUnavail && bUnavail) return -1;
+                        
+                        const activeCasts = state?.attributes?.active_casts || [];
+                        const aActive = activeCasts.includes(a.entity_id);
+                        const bActive = activeCasts.includes(b.entity_id);
+                        if (aActive && !bActive) return -1;
+                        if (!aActive && bActive) return 1;
+                        
+                        return (a.attributes.friendly_name || a.entity_id).localeCompare(b.attributes.friendly_name || b.entity_id);
+                      });
+                      
+                      const searchText = (this._castSearchText || '').toLowerCase();
+                      if (searchText) {
+                        topLevelDevices = topLevelDevices.filter(s => (s.attributes.friendly_name || s.entity_id).toLowerCase().includes(searchText));
+                      }
+                      
+                      return topLevelDevices.map(s => {
+                        const isExpanded = this._castExpandedGroups.includes(s.entity_id);
+                        const myChildrenIds = groups[s.entity_id] || [];
+                        const hasChildren = myChildrenIds.length > 0;
+                        
+                        let icon = 'mdi:cast-connected';
+                        const dclass = s.attributes.device_class;
+                        if (dclass === 'tv') icon = 'mdi:television';
+                        else if (dclass === 'speaker') icon = 'mdi:speaker';
+                        else if (dclass === 'receiver') icon = 'mdi:audio-video';
+                        
+                        const isActive = state?.attributes?.active_casts && state.attributes.active_casts.includes(s.entity_id);
+                        const isUnavailable = s.state === 'unavailable';
+                        
+                        return html`
+                          <div style="display:flex; flex-direction:column; background:${isExpanded ? 'rgba(255,255,255,0.03)' : 'transparent'}; border-radius:8px; transition:all 0.2s;">
+                            <div style="display:flex; justify-content:space-between; align-items:center; padding:10px 12px; border-radius:8px; cursor:${isUnavailable ? 'not-allowed' : 'pointer'}; opacity:${isUnavailable ? '0.4' : '1'};" onmouseover="if(!${isUnavailable}) this.style.background='rgba(255,255,255,0.1)'" onmouseout="this.style.background='transparent'">
+                              <div style="display:flex; align-items:center; gap:12px; overflow:hidden; flex-grow:1;" @click="${() => { if (!isUnavailable) { isActive ? this._stopCast(currentRoom.entity, s.entity_id) : this._castStream(currentRoom.entity, s.entity_id) } }}">
+                                <ha-icon icon="${icon}" style="color:${isActive ? '#2ecc71' : '#aaa'}; --mdc-icon-size:20px; flex-shrink:0;"></ha-icon>
+                                <div style="display:flex; flex-direction:column; gap:2px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">
+                                  <div style="display:flex; align-items:center; gap:6px;">
+                                    <span style="color:${isActive ? '#2ecc71' : '#fff'}; font-weight:500; font-size:0.9rem; text-overflow:ellipsis; overflow:hidden;">${s.attributes.friendly_name || s.entity_id}</span>
+                                    ${hasChildren ? html`<span style="background:rgba(255,255,255,0.1); color:#ccc; font-size:0.65rem; padding:2px 6px; border-radius:10px; font-weight:bold;">+${myChildrenIds.length}</span>` : ''}
+                                  </div>
+                                  <span style="color:rgba(255,255,255,0.5); font-size:0.75rem; display:flex; align-items:center; gap:4px; text-overflow:ellipsis; overflow:hidden;">
+                                    ${!isUnavailable && s.state !== 'off' ? html`<span style="width:6px; height:6px; border-radius:50%; background:#2ecc71; flex-shrink:0;"></span>` : html`<span style="width:6px; height:6px; border-radius:50%; background:rgba(255,255,255,0.2); flex-shrink:0;"></span>`}
+                                    ${s.state.charAt(0).toUpperCase() + s.state.slice(1)} 
+                                    ${s.attributes.app_name && !isUnavailable ? html`<span style="text-overflow:ellipsis; overflow:hidden;">• ${s.attributes.app_name}</span>` : ''}
+                                  </span>
+                                </div>
+                              </div>
+                              <div style="display:flex; align-items:center; gap:8px; flex-shrink:0;">
+                                <div style="width:24px; height:24px; display:flex; justify-content:center; align-items:center; border-radius:50%; background:rgba(255,255,255,0.05); cursor:pointer;" @click="${(e) => { e.stopPropagation(); this._toggleExpandedGroup(s.entity_id); }}">
+                                  <ha-icon icon="${isExpanded ? 'mdi:chevron-up' : 'mdi:chevron-down'}" style="color:#fff; --mdc-icon-size:18px;"></ha-icon>
+                                </div>
+                                <div style="width:20px; height:20px; border-radius:4px; border:2px solid ${isActive ? '#2ecc71' : 'rgba(255,255,255,0.3)'}; background:${isActive ? '#2ecc71' : 'transparent'}; display:flex; justify-content:center; align-items:center; transition:all 0.2s;" @click="${() => { if (!isUnavailable) { isActive ? this._stopCast(currentRoom.entity, s.entity_id) : this._castStream(currentRoom.entity, s.entity_id) } }}">
+                                  ${isActive ? html`<ha-icon icon="mdi:check" style="color:#111; --mdc-icon-size:16px;"></ha-icon>` : html``}
+                                </div>
+                              </div>
+                            </div>
+                            
+                            ${isExpanded ? html`
+                              <div style="padding:4px 8px 12px 32px; display:flex; flex-direction:column; gap:4px; border-top:1px solid rgba(255,255,255,0.05); margin-top:4px;">
+                                <div style="font-size:0.75rem; color:#aaa; margin-bottom:4px; padding-left:4px;">Group with:</div>
+                                ${allDevices.filter(d => d.entity_id !== s.entity_id && (!allChildren.has(d.entity_id) || myChildrenIds.includes(d.entity_id))).sort((a, b) => {
+                                  const aUnavail = a.state === 'unavailable';
+                                  const bUnavail = b.state === 'unavailable';
+                                  if (aUnavail && !bUnavail) return 1;
+                                  if (!aUnavail && bUnavail) return -1;
+                                  
+                                  const activeCasts = state?.attributes?.active_casts || [];
+                                  const aActive = activeCasts.includes(a.entity_id);
+                                  const bActive = activeCasts.includes(b.entity_id);
+                                  if (aActive && !bActive) return -1;
+                                  if (!aActive && bActive) return 1;
+                                  
+                                  return (a.attributes.friendly_name || a.entity_id).localeCompare(b.attributes.friendly_name || b.entity_id);
+                                }).map(childCandidate => {
+                                  const isChecked = myChildrenIds.includes(childCandidate.entity_id);
+                                  return html`
+                                    <div style="display:flex; justify-content:space-between; align-items:center; padding:6px 8px; border-radius:6px; cursor:pointer;" onmouseover="this.style.background='rgba(255,255,255,0.05)'" onmouseout="this.style.background='transparent'" @click="${() => this._toggleGroupTarget(s.entity_id, childCandidate.entity_id, isChecked)}">
+                                      <span style="color:${isChecked ? '#fff' : '#aaa'}; font-size:0.85rem; text-overflow:ellipsis; overflow:hidden; white-space:nowrap;">${childCandidate.attributes.friendly_name || childCandidate.entity_id}</span>
+                                      <div style="width:16px; height:16px; border-radius:3px; border:2px solid ${isChecked ? '#3498db' : 'rgba(255,255,255,0.3)'}; background:${isChecked ? '#3498db' : 'transparent'}; display:flex; justify-content:center; align-items:center; flex-shrink:0;">
+                                        ${isChecked ? html`<ha-icon icon="mdi:check" style="color:#111; --mdc-icon-size:14px;"></ha-icon>` : html``}
+                                      </div>
+                                    </div>
+                                  `;
+                                })}
+                              </div>
+                            ` : ''}
+                          </div>
+                        `;
+                      });
+                    })()}
+                  </div>
+                </div>
+              ` : html``}
+            </div>
 
             <button class="refresh-btn ${this._refreshInfo ? 'animating-out' : ''}" @click="${() => this._refreshAnalysis(currentRoom.entity)}">
               <ha-icon icon="mdi:refresh" class="refresh-icon"></ha-icon>
@@ -1013,60 +1281,31 @@ class AiMediaMatrixCard extends LitElement {
         </div>
         
         <!-- CAMERA POPUP OVERLAY -->
-        <div class="live-camera-popup ${this._showCameraOverlay ? '' : 'hidden'}">
+        <div class="live-camera-popup ${this._showCameraOverlay ? '' : 'hidden'}" style="pointer-events:auto;">
           <ha-icon icon="mdi:close" class="live-camera-close" @click="${() => this._showCameraOverlay = false}"></ha-icon>
-          ${this._showCameraOverlay && cameraEntityId ? html`<hui-image .hass=${this.hass} .cameraImage=${cameraEntityId} .cameraView=${"live"} style="width:100%; height:100%; display:block; object-fit:cover; pointer-events:none;"></hui-image>` : html``}
+          ${this._showCameraOverlay && cameraEntityId ? html`
+            <ha-camera-stream 
+              .hass=${this.hass} 
+              .stateObj=${this.hass.states[cameraEntityId]} 
+              ?muted=${this._cameraMuted}
+              style="width:100%; height:100%; display:block; object-fit:cover; pointer-events:none;">
+            </ha-camera-stream>
+            
+            <div style="position:absolute; bottom:20px; left:50%; transform:translateX(-50%); display:flex; align-items:center; gap:12px; background:rgba(30,30,30,0.85); padding:8px 20px; border-radius:30px; backdrop-filter:blur(10px); z-index:10001; transition:opacity 0.3s; opacity:0; width:60%; border:1px solid rgba(255,255,255,0.1); box-shadow:0 10px 30px rgba(0,0,0,0.5);" 
+                 class="camera-controls-overlay">
+              
+              <ha-icon icon="${this._cameraMuted ? 'mdi:volume-off' : (this._cameraVolume > 0.5 ? 'mdi:volume-high' : 'mdi:volume-medium')}" 
+                       style="color:#fff; cursor:pointer; --mdc-icon-size:24px;" 
+                       @click="${() => { this._cameraMuted = !this._cameraMuted; this._updateCameraVolume(); }}"></ha-icon>
+              
+              <input type="range" min="0" max="1" step="0.05" .value="${this._cameraVolume}" 
+                     @input="${(e) => { this._cameraVolume = parseFloat(e.target.value); this._cameraMuted = false; this._updateCameraVolume(); }}"
+                     style="flex-grow:1; cursor:pointer; accent-color:#1e5c8a;">
+            </div>
+          ` : html``}
         </div>
 
-        <!-- CAST MODAL -->
-        ${this._showCastModal ? html`
-          <div style="position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.8); z-index:10001; display:flex; justify-content:center; align-items:center;">
-            <div style="background:#1a1a1a; padding:24px; border-radius:12px; width:450px; max-width:90%; border:1px solid rgba(255,255,255,0.1);">
-              <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:16px;">
-                <h2 style="color:#fff; margin:0;">Cast Stream</h2>
-                <ha-icon icon="mdi:close" style="color:#aaa; cursor:pointer;" @click="${() => this._showCastModal = false}"></ha-icon>
-              </div>
-              <p style="color:#aaa; font-size:0.9rem; margin-bottom:12px;">Select a destination player to follow you with this room's stream:</p>
-              
-              <input type="text" placeholder="Search devices..." @input="${(e) => this._castSearchText = e.target.value.toLowerCase()}" style="width:100%; padding:10px; border-radius:6px; border:1px solid rgba(255,255,255,0.2); background:rgba(255,255,255,0.05); color:#fff; margin-bottom:16px; box-sizing:border-box;">
 
-              <div style="max-height:300px; overflow-y:auto; display:flex; flex-direction:column; gap:8px;">
-                ${Object.values(this.hass.states)
-                  .filter(s => {
-                    if (!s.entity_id.startsWith('media_player.')) return false;
-                    if (s.entity_id.startsWith('media_player.ai_media_')) return false;
-                    
-                    const allowedTargets = state?.attributes?.cast_targets || [];
-                    if (allowedTargets.length > 0 && !allowedTargets.includes(s.entity_id)) return false;
-                    
-                    if (this._castSearchText) {
-                      const nameMatch = s.attributes.friendly_name?.toLowerCase().includes(this._castSearchText);
-                      const idMatch = s.entity_id.toLowerCase().includes(this._castSearchText);
-                      if (!nameMatch && !idMatch) return false;
-                    }
-                    
-                    return true;
-                  })
-                  .map(s => {
-                    let icon = 'mdi:cast-connected';
-                    const dclass = s.attributes.device_class;
-                    if (dclass === 'tv') icon = 'mdi:television';
-                    else if (dclass === 'speaker') icon = 'mdi:speaker';
-                    else if (dclass === 'receiver') icon = 'mdi:audio-video';
-                    
-                    return html`
-                    <div style="display:flex; justify-content:space-between; align-items:center; padding:12px; background:rgba(255,255,255,0.05); border-radius:8px; cursor:pointer; transition:background 0.2s;" @click="${() => this._castStream(currentRoom.entity, s.entity_id)}" onmouseover="this.style.background='rgba(255,255,255,0.1)'" onmouseout="this.style.background='rgba(255,255,255,0.05)'">
-                      <div style="display:flex; flex-direction:column; gap:2px;">
-                        <span style="color:#fff; font-weight: 500;">${s.attributes.friendly_name || s.entity_id}</span>
-                        <span style="color:rgba(255,255,255,0.4); font-size:0.75rem; font-family:monospace;">${s.entity_id}</span>
-                      </div>
-                      <ha-icon icon="${icon}" style="color:#1e5c8a;"></ha-icon>
-                    </div>
-                  `})}
-              </div>
-            </div>
-          </div>
-        ` : html``}
 
         ${isPlaying ? html`
           <div class="ui-layer bottom-display-zone">

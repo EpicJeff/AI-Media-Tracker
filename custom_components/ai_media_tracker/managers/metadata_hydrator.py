@@ -34,7 +34,7 @@ class MetadataHydrator:
                 m_type = item.get("media_type", "movie")
                 
                 # Fetch detailed metadata (credits, ratings, runtime)
-                details_url = f"https://api.themoviedb.org/3/{m_type}/{item_id}?api_key={self.api_key}&append_to_response=credits,release_dates,videos"
+                details_url = f"https://api.themoviedb.org/3/{m_type}/{item_id}?api_key={self.api_key}&append_to_response=credits,release_dates,content_ratings,videos"
                 
                 async with session.get(details_url) as det_resp:
                     details = await det_resp.json()
@@ -48,6 +48,18 @@ class MetadataHydrator:
                     runtime = details.get("runtime")
                     if not runtime and runtimes:
                         runtime = runtimes[0]
+                        
+                    content_rating = None
+                    if m_type == "movie":
+                        releases = details.get("release_dates", {}).get("results", [])
+                        us_release = next((r for r in releases if r.get("iso_3166_1") == "US"), None)
+                        if us_release and us_release.get("release_dates"):
+                            content_rating = us_release["release_dates"][0].get("certification")
+                    elif m_type == "tv":
+                        ratings = details.get("content_ratings", {}).get("results", [])
+                        us_rating = next((r for r in ratings if r.get("iso_3166_1") == "US"), None)
+                        if us_rating:
+                            content_rating = us_rating.get("rating")
 
                     import random
                     
@@ -79,6 +91,7 @@ class MetadataHydrator:
                     return {
                         "overview": details.get("overview", ""),
                         "rating": details.get("vote_average"),
+                        "content_rating": content_rating,
                         "runtime": runtime,
                         "genres": [g["name"] for g in details.get("genres", [])],
                         "release_date": details.get("release_date") or details.get("first_air_date"),

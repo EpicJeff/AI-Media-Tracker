@@ -27,6 +27,7 @@ from .managers.guardrail_manager import GuardrailManager
 from .pipeline.resolver import resolve_media
 from .pipeline.native_stage import extract_native_state
 from .pipeline.vlm_stage import optimize_image_for_vlm, validate_vlm_result
+from .vlm_client import async_build_client
 
 _LOGGER = logging.getLogger(__name__)
 PLATFORMS = [Platform.MEDIA_PLAYER, Platform.CAMERA, Platform.SENSOR]
@@ -56,7 +57,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     meta_hydrator = MetadataHydrator(hass, tmdb_key)
     guardrail_mgr = GuardrailManager(hass, entry)
     
-    from .managers.routing_manager import AudioProxyView, VideoProxyView, WebSocketProxyView, ActiveCastProxyView
+    from .managers.routing_manager import AudioProxyView, VideoProxyView, WebSocketProxyView, ActiveCastProxyView, RoutingManager
     hass.http.register_view(AudioProxyView(hass))
     hass.http.register_view(VideoProxyView(hass))
     hass.http.register_view(WebSocketProxyView(hass))
@@ -66,7 +67,18 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     storage_mgr = StorageManager(hass)
     await storage_mgr.async_load()
     
+    from .managers.notification_manager import NotificationManager
+    notif_mgr = NotificationManager(hass)
+    await notif_mgr.async_load()
+    
+    from .managers.group_manager import GroupManager
+    group_mgr = GroupManager(hass)
+    await group_mgr.async_load()
+
+    vlm_client = await async_build_client(hass, entry)
+
     hass.data[DOMAIN][entry.entry_id] = {
+        "vlm_client": vlm_client,
         "metadata_mgr": meta_mgr,
         "storage_mgr": storage_mgr,
         "analysis_mgr": anal_mgr,
@@ -75,7 +87,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         "meta_hydrator": meta_hydrator,
         "guide_mgr": guide_mgr,
         "guardrail_mgr": guardrail_mgr,
-        "media_players": {},       
+        "notif_mgr": notif_mgr,
+        "group_mgr": group_mgr,
+        "players": {},       
+        "active_routes": {},
         "cameras": {},       
         "player_to_source": {}, 
         "unsub_listeners": [],
@@ -156,6 +171,40 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         if len(check_title) > 15: return True
         return True
 
+    async def enforce_guardrails(player_name, title, series_title, resolved_data_dict):
+        guardrail_mgr = hass.data[DOMAIN][entry.entry_id].get("guardrail_mgr")
+        if not guardrail_mgr: return None
+        
+        violation_tag = guardrail_mgr.evaluate(player_name, resolved_data_dict)
+        if violation_tag:
+            _LOGGER.warning("Content Guardrail Violation for %s! Tag: %s", player_name, violation_tag)
+            source_entity_id = hass.data[DOMAIN][entry.entry_id].get("player_to_source", {}).get(player_name)
+            if source_entity_id:
+                hass.async_create_task(
+                    hass.services.async_call("media_player", "media_pause", {"entity_id": source_entity_id}, blocking=False)
+                )
+            
+            notif_mgr = hass.data[DOMAIN][entry.entry_id].get("notif_mgr")
+            if notif_mgr:
+                msg_title = series_title if series_title else title
+                await notif_mgr.async_create_notification(
+                    title=f"Blocked: {msg_title}",
+                    message=f"A show matching the restricted '{violation_tag}' criteria started playing on {player_name}.",
+                    notif_type="violation",
+                    image_url=resolved_data_dict.get("entity_picture"),
+                    player_name=player_name
+                )
+            
+            hass.bus.async_fire("ai_media_tracker_guardrail_violation", {
+                "player_name": player_name,
+                "entity_id": source_entity_id,
+                "violation_tag": violation_tag,
+                "title": title,
+                "series_title": series_title
+            })
+            return violation_tag
+        return None
+
     async def update_proxy_from_native(entity_id: str, state):
         player_name = entity_to_player_name_map.get(entity_id)
         if not player_name: return
@@ -214,6 +263,19 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 "show_info": rich_metadata
             }
         })
+        
+        current_data = meta_mgr.get(player_name).__dict__
+        tag = await enforce_guardrails(player_name, original_title, series_title, current_data)
+        if tag:
+            meta_mgr.merge(player_name, {
+                "is_content_blocked": True,
+                "content_violation_tag": tag
+            })
+        else:
+            meta_mgr.merge(player_name, {
+                "is_content_blocked": False,
+                "content_violation_tag": None
+            })
         
         if player_obj := hass.data[DOMAIN][entry.entry_id].get("players", {}).get(player_name):
             player_obj.async_write_ha_state()
@@ -363,6 +425,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                         "series_title": None,
                         "state": "paused",
                         "entity_picture": None,
+                        "is_content_blocked": False,
+                        "content_violation_tag": None,
                         "extra_attributes": {
                             "app_name": final_app,
                             "channel_platform_name": final_app,
@@ -380,7 +444,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                     
                     if p := hass.data[DOMAIN][entry.entry_id].get("players", {}).get(player_name): p.async_write_ha_state()
                 elif current_state != "idle":
-                    meta_mgr.merge(player_name, {"title": "System Standby", "state": "idle", "entity_picture": None, "logo_url": None, "extra_attributes": {}})
+                    meta_mgr.merge(player_name, {"title": "System Standby", "state": "idle", "entity_picture": None, "logo_url": None, "is_content_blocked": False, "content_violation_tag": None, "extra_attributes": {}})
                     if p := hass.data[DOMAIN][entry.entry_id].get("players", {}).get(player_name): p.async_write_ha_state()
                 return True
             return False
@@ -417,6 +481,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                     if not (state_changed_to_playing or app_switched or metadata_changed or duration_changed): return
 
                 last_trigger_times[entity_id] = now
+                
+                is_only_duration_change = duration_changed and not (state_changed_to_playing or app_switched or metadata_changed or state_changed_to_paused_idle)
+                if is_only_duration_change and player_name in sports_mgr._active_tasks:
+                    return
+
                 sports_mgr.stop_tracking(player_name)
                 
                 if not is_app_silent(new_state):
@@ -460,6 +529,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                                     "series_title": None,
                                     "state": fresh_state.state,
                                     "entity_picture": None,
+                                    "is_content_blocked": False,
+                                    "content_violation_tag": None,
                                     "extra_attributes": {
                                         "app_name": app_name_fresh,
                                         "channel_platform_name": app_name_fresh,
@@ -523,11 +594,65 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     if tracked_media_players:
         unsub = async_track_state_change_event(hass, tracked_media_players, _handle_streaming_state_change)
         hass.data[DOMAIN][entry.entry_id]["unsub_listeners"].append(unsub)
+        
+    async def _async_target_state_change_listener(event):
+        new_state = event.data.get("new_state")
+        if not new_state: return
+        entity_id = event.data.get("entity_id")
+        if not entity_id or not entity_id.startswith("media_player."): return
+        
+        active_routes = hass.data[DOMAIN][entry.entry_id].get("active_routes", {})
+        if entity_id in active_routes:
+            should_drop = False
+            if new_state.state in ("off", "unavailable"):
+                should_drop = True
+                
+            app_id = new_state.attributes.get("app_id")
+            app_name = new_state.attributes.get("app_name")
+            
+            # CC1AD845 is the Default Media Receiver (used when fallback play_media runs)
+            valid_app_ids = ["35101F1D", "CC1AD845", None] 
+            valid_app_names = [
+                "Default Media Receiver", 
+                "AI Media Tracker", 
+                "HA AV Over IP Receiver", 
+                "Media Assistant Cast", 
+                "Home Assistant", 
+                "Roku Media Player"
+            ]
+            
+            if app_id and app_id not in valid_app_ids:
+                should_drop = True
+            elif app_name and app_name not in valid_app_names:
+                should_drop = True
+                
+            if should_drop:
+                source_player = active_routes.pop(entity_id, None)
+                if source_player:
+                    _LOGGER.info("Target %s stopped casting from %s (state: %s, app_id: %s, app_name: %s)", entity_id, source_player, new_state.state, app_id, app_name)
+                    if p := hass.data[DOMAIN][entry.entry_id].get("players", {}).get(source_player):
+                        p.async_write_ha_state()
+            elif new_state.state in ("idle", "standby") and not app_id and not app_name:
+                # If the device goes idle without an app_id or app_name, it might be returning to the home screen.
+                # We wait 5 seconds to ensure it isn't just a transient buffering state during cast initialization.
+                import asyncio
+                async def _verify_idle_drop():
+                    await asyncio.sleep(5)
+                    current = hass.states.get(entity_id)
+                    if current and current.state in ("idle", "standby") and not current.attributes.get("app_id") and not current.attributes.get("app_name"):
+                        source_player = active_routes.pop(entity_id, None)
+                        if source_player:
+                            _LOGGER.info("Target %s stayed idle for 5s, assuming cast exited from %s", entity_id, source_player)
+                            if p := hass.data[DOMAIN][entry.entry_id].get("players", {}).get(source_player):
+                                p.async_write_ha_state()
+                hass.async_create_task(_verify_idle_drop())
 
-    ollama_url = entry.options.get("ollama_url", entry.data.get("ollama_url", "http://localhost:11434"))
-    model_name = entry.options.get("model_name", entry.data.get("model_name", "qwen3.5-vl:2b"))
-    if ollama_url and model_name:
-        entry.async_create_background_task(hass, async_preload_ollama_model(hass, ollama_url, model_name), "ollama-preload")
+    unsub_target = hass.bus.async_listen("state_changed", _async_target_state_change_listener)
+    hass.data[DOMAIN][entry.entry_id]["unsub_listeners"].append(unsub_target)
+
+    # Warms the local model so the first frame does not pay a cold-load
+    # penalty. A no-op when the Gemini path is the only one configured.
+    entry.async_create_background_task(hass, vlm_client.preload(), "vlm-preload")
 
     async def handle_refresh_analysis(call):
         entity_id = call.data.get("entity_id")
@@ -565,8 +690,96 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             from .managers.routing_manager import RoutingManager
             await RoutingManager.cast_stream(hass, entry, player_name, target_receivers)
 
+    async def handle_stop_cast(call):
+        source_entity_id = call.data.get("entity_id")
+        target_receivers = call.data.get("target_receivers", [])
+        if not source_entity_id or not target_receivers: return
+        if isinstance(source_entity_id, list): source_entity_id = source_entity_id[0]
+        if isinstance(target_receivers, str): target_receivers = [target_receivers]
+        
+        player_name = entity_to_player_name_map.get(source_entity_id)
+        if not player_name:
+            for name, proxy in hass.data[DOMAIN][entry.entry_id].get("players", {}).items():
+                if proxy.entity_id == source_entity_id:
+                    player_name = name
+                    break
+                    
+        if player_name:
+            _LOGGER.info("Stop Cast requested for %s to %s", player_name, target_receivers)
+            from .managers.routing_manager import RoutingManager
+            await RoutingManager.stop_cast(hass, entry, player_name, target_receivers)
+
+    async def handle_create_notification(call):
+        notif_mgr = hass.data[DOMAIN][entry.entry_id].get("notif_mgr")
+        if notif_mgr:
+            await notif_mgr.async_create_notification(
+                title=call.data.get("title", "Notification"),
+                message=call.data.get("message", ""),
+                notif_type=call.data.get("type", "info"),
+                image_url=call.data.get("image_url"),
+                player_name=call.data.get("player_name")
+            )
+
+    async def handle_clear_notification(call):
+        notif_mgr = hass.data[DOMAIN][entry.entry_id].get("notif_mgr")
+        if notif_mgr:
+            await notif_mgr.async_clear_notification(call.data.get("notification_id"))
+
+    async def handle_mark_notifications_read(call):
+        notif_mgr = hass.data[DOMAIN][entry.entry_id].get("notif_mgr")
+        if notif_mgr:
+            await notif_mgr.async_mark_read(call.data.get("notification_id"))
+
+    async def handle_group_targets(call):
+        group_mgr = hass.data[DOMAIN][entry.entry_id].get("group_mgr")
+        if group_mgr:
+            parent = call.data.get("parent_entity_id")
+            children = call.data.get("child_entity_ids", [])
+            if isinstance(children, str): children = [children]
+            if parent and children:
+                flattened_added = await group_mgr.async_group_targets(parent, children)
+                for p in hass.data[DOMAIN][entry.entry_id].get("players", {}).values():
+                    p.async_write_ha_state()
+                
+                # Automatically route stream if parent is active
+                active_routes = hass.data[DOMAIN][entry.entry_id].get("active_routes", {})
+                if parent in active_routes and flattened_added:
+                    source_player = active_routes[parent]
+                    await RoutingManager.cast_stream(hass, entry, source_player, flattened_added)
+
+    async def handle_ungroup_targets(call):
+        group_mgr = hass.data[DOMAIN][entry.entry_id].get("group_mgr")
+        if group_mgr:
+            children = call.data.get("child_entity_ids", [])
+            if isinstance(children, str): children = [children]
+            if children:
+                # Find parents before ungrouping to know if we need to stop cast
+                parents_to_stop = {}
+                for child in children:
+                    parent = group_mgr.get_parent_for_child(child)
+                    if parent:
+                        if parent not in parents_to_stop: parents_to_stop[parent] = []
+                        parents_to_stop[parent].append(child)
+                        
+                await group_mgr.async_ungroup_targets(children)
+                for p in hass.data[DOMAIN][entry.entry_id].get("players", {}).values():
+                    p.async_write_ha_state()
+                    
+                # Automatically stop routing if parent was active
+                active_routes = hass.data[DOMAIN][entry.entry_id].get("active_routes", {})
+                for parent, parent_children in parents_to_stop.items():
+                    if parent in active_routes:
+                        source_player = active_routes[parent]
+                        await RoutingManager.stop_cast(hass, entry, source_player, parent_children)
+
     hass.services.async_register(DOMAIN, "refresh_analysis", handle_refresh_analysis)
     hass.services.async_register(DOMAIN, "follow_me", handle_follow_me)
+    hass.services.async_register(DOMAIN, "stop_cast", handle_stop_cast)
+    hass.services.async_register(DOMAIN, "create_notification", handle_create_notification)
+    hass.services.async_register(DOMAIN, "clear_notification", handle_clear_notification)
+    hass.services.async_register(DOMAIN, "mark_notifications_read", handle_mark_notifications_read)
+    hass.services.async_register(DOMAIN, "group_targets", handle_group_targets)
+    hass.services.async_register(DOMAIN, "ungroup_targets", handle_ungroup_targets)
 
     return True
 
@@ -746,27 +959,13 @@ async def _apply_consensus_to_ui(hass, entry, player_name, vlm_result):
                 resolved_data["extra_attributes"]["network_name"] = net_name
 
     # Guardrail evaluation
-    if "guardrail_mgr" in data:
-        violation_tag = data["guardrail_mgr"].evaluate(player_name, resolved_data)
-        if violation_tag:
-            _LOGGER.warning("Content Guardrail Violation for %s! Tag: %s", player_name, violation_tag)
-            
-            source_entity_id = data.get("player_to_source", {}).get(player_name)
-            if source_entity_id:
-                hass.async_create_task(
-                    hass.services.async_call("media_player", "media_pause", {"entity_id": source_entity_id}, blocking=False)
-                )
-            
-            hass.bus.async_fire("ai_media_tracker_guardrail_violation", {
-                "player_name": player_name,
-                "entity_id": source_entity_id,
-                "violation_tag": violation_tag,
-                "title": resolved_data.get("title", ""),
-                "series_title": resolved_data.get("series_title", "")
-            })
-            
-            resolved_data["title"] = "Restricted Content Blocked"
-            resolved_data["series_title"] = ""
+    tag = await enforce_guardrails(player_name, resolved_data.get("title", ""), resolved_data.get("series_title", ""), resolved_data)
+    if tag:
+        resolved_data["is_content_blocked"] = True
+        resolved_data["content_violation_tag"] = tag
+    else:
+        resolved_data["is_content_blocked"] = False
+        resolved_data["content_violation_tag"] = None
 
     search_title = resolved_data.get("series_title") or resolved_data.get("title", "")
     assets = await data["artwork_mgr"].async_get_artwork(
@@ -790,59 +989,50 @@ async def _check_for_progress_bar(hass, entry, player_name, image_bytes) -> bool
     def _crop_progress_bar(img_bytes):
         from PIL import Image
         import io
-        import base64
         img = Image.open(io.BytesIO(img_bytes))
         width, height = img.size
         # Crop to the bottom 33%
-        cropped = img.crop((0, int(height * 0.66), width, height))
+        cropped = img.crop((0, int(height * 0.66), width, height)).convert("RGB")
         buf = io.BytesIO()
         cropped.save(buf, format="JPEG")
-        return base64.b64encode(buf.getvalue()).decode('utf-8')
+        return buf.getvalue()
 
     try:
-        b64_image = await hass.async_add_executor_job(_crop_progress_bar, image_bytes)
+        cropped_bytes = await hass.async_add_executor_job(_crop_progress_bar, image_bytes)
     except Exception as e:
         _LOGGER.error("Failed to crop image for progress bar check: %s", e)
         return False
-        
-    ollama_url = entry.options.get("ollama_url", entry.data.get("ollama_url", "http://localhost:11434"))
-    model_name = entry.options.get("model_name", entry.data.get("model_name", "qwen3.5-vl:4b"))
-    
+
+
     prompt = "Does this image contain a video progress bar or scrubber timeline? Reply strictly with a JSON object: {\"has_progress_bar\": true} or {\"has_progress_bar\": false}"
-            
-    _LOGGER.info("Requesting VLM analysis with prompt: %s", prompt)
+
+    client = hass.data[DOMAIN][entry.entry_id].get("vlm_client")
+    if not client:
+        return False
 
     try:
-        async with asyncio.timeout(10):
-            session = async_get_clientsession(hass)
-            response = await session.post(f"{ollama_url}/api/generate", json={"model": model_name, "prompt": prompt, "images": [b64_image], "stream": False, "format": "json"})
-            if response.status == 200:
-                res_text = await response.text()
-                res_json = json.loads(res_text)
-                reply = res_json.get("response", "").strip() or res_json.get("thinking", "").strip()
-                if "`" in reply: 
-                    reply = re.sub(r"`{3}(?:json)?", "", reply).strip()
-                match = re.search(r"\{.*\}", reply, re.DOTALL)
-                if match:
-                    result = json.loads(match.group(0))
-                    _LOGGER.info("VLM response: %s", res_text)
-                    return result.get("has_progress_bar", False)
+        # 30s rather than the old 10s: a local Ollama model needs far longer
+        # than 10s per frame, so the previous timeout meant this check always
+        # failed and silently reported "no progress bar".
+        result = await client.analyze(prompt, cropped_bytes, timeout=30)
+        if result:
+            return bool(result.get("has_progress_bar", False))
     except Exception as e:
         _LOGGER.error("Progress bar check failed for %s: %s", player_name, e)
     return False
 
 async def _single_frame_analysis(hass, entry, player_name, image_bytes, force_full_parse=False) -> dict:
-    ollama_url = entry.options.get("ollama_url", entry.data.get("ollama_url", "http://localhost:11434"))
-    model_name = entry.options.get("model_name", entry.data.get("model_name", "qwen3.5-vl:4b"))
-
     try:
         optimized_bytes = await hass.async_add_executor_job(optimize_image_for_vlm, image_bytes)
-        b64_image = base64.b64encode(optimized_bytes).decode('utf-8')
     except Exception as e:
         _LOGGER.error("Image optimization failed for %s: %s", player_name, e)
         return {}
 
     data = hass.data[DOMAIN][entry.entry_id]
+    client = data.get("vlm_client")
+    if not client:
+        _LOGGER.error("No VLM client configured for %s", player_name)
+        return {}
     source_entity_id = data.get("player_to_source", {}).get(player_name, f"media_player.{player_name.lower().replace(' ', '_')}")
     native_state_raw = hass.states.get(source_entity_id)
     native_state = extract_native_state(native_state_raw) or {}
@@ -1002,61 +1192,45 @@ f"{schema_game_state}\n"
                 "}"
             )
             
-        _LOGGER.info("Requesting VLM analysis with prompt: %s", prompt)
+        _LOGGER.debug("Requesting VLM analysis for %s (sports=%s)", player_name, bool(is_sports))
 
         try:
-            async with asyncio.timeout(60):
-                session = async_get_clientsession(hass)
-                response = await session.post(f"{ollama_url}/api/generate", json={"model": model_name, "prompt": prompt, "images": [b64_image], "stream": False, "format": "json"})
-                if response.status == 200:
-                    res_text = await response.text()
-                    try:
-                        res_json = json.loads(res_text)
-                    except json.JSONDecodeError as e:
-                        _LOGGER.error("VLM returned invalid JSON response for %s: %s", player_name, e)
-                        return {}
+            # Escalate to the higher-quality Flash tier only on a full
+            # identification pass. Sports score polling reads a scorebug that
+            # the primary tier handles reliably, and that path is far too
+            # frequent to spend the small Flash budget on.
+            allow_escalation = not active_sports_task and not is_sports
+            result = await client.analyze(
+                prompt, optimized_bytes, timeout=45, allow_escalation=allow_escalation
+            )
 
-                    reply = res_json.get("response", "").strip() or res_json.get("thinking", "").strip()
-                    if reply:
-                        if "`" in reply: 
-                            reply = re.sub(r"`{3}(?:json)?", "", reply).strip()
-                        
-                        match = re.search(r"\{.*\}", reply, re.DOTALL)
-                        if not match:
-                            _LOGGER.error("VLM response contained no valid JSON structure for %s", player_name)
-                            return {}
-                        
-                        try:
-                            result = json.loads(match.group(0))
-                        except json.JSONDecodeError as e:
-                            _LOGGER.error("Failed to decode JSON from VLM match for %s: %s", player_name, e)
-                            return {}
-                            
-                        if result.get("is_sports_broadcast") is True:
-                            _LOGGER.info("VLM detected sports broadcast on VOD app. Falling back to sports prompt.")
-                            is_sports = True
-                            continue
-                            
-                        if active_sports_task and "sports_info" not in result:
-                            game_state = result.get("game_state", result)
-                            result = {
-                                "sports_info": {
-                                    "sport": active_sports_task[0],
-                                    "league": active_sports_task[1],
-                                    "game_state": game_state
-                                }
-                            }
+            if not result:
+                _LOGGER.debug("VLM returned no usable result for %s", player_name)
+                return {}
 
-                        if not validate_vlm_result(result):
-                            return {}
-                        
-                        _LOGGER.info("VLM response: %s", res_text)
-                        return result
-        except asyncio.TimeoutError:
-            _LOGGER.error("VLM request timed out for %s", player_name)
+            if result.get("is_sports_broadcast") is True:
+                _LOGGER.info("VLM detected sports broadcast on VOD app. Falling back to sports prompt.")
+                is_sports = True
+                continue
+
+            if active_sports_task and "sports_info" not in result:
+                game_state = result.get("game_state", result)
+                result = {
+                    "sports_info": {
+                        "sport": active_sports_task[0],
+                        "league": active_sports_task[1],
+                        "game_state": game_state
+                    }
+                }
+
+            if not validate_vlm_result(result):
+                return {}
+
+            _LOGGER.debug("VLM response for %s: %s", player_name, result)
+            return result
         except Exception as e:
             _LOGGER.error("VLM processing failure on %s: %s", player_name, e)
-            
+
     return {}
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
@@ -1081,9 +1255,4 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         hass.data[DOMAIN].pop(entry.entry_id, None)
     return result
 
-async def async_preload_ollama_model(hass, url, model):
-    try:
-        session = async_get_clientsession(hass)
-        await session.post(f"{url}/api/generate", json={"model": model})
-    except Exception: pass
 

@@ -21,11 +21,14 @@ class MediaState:
     vlm_enriched: bool = False
     artwork_resolved: bool = False
     last_updated: float = 0.0
+    is_content_blocked: bool = False
+    content_violation_tag: Optional[str] = None
 
     # Logic flags
     native_metadata: bool = False
     vlm_analysis: bool = False
     last_kickstart: float = 0.0
+    last_announced_title: Optional[str] = None
 
     # New deep metadata fields
     scene_analysis: dict = field(default_factory=dict)

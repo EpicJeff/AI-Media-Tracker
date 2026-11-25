@@ -1,0 +1,70 @@
+{
+  "options": {
+    "step": {
+      "init": {
+        "title": "AI Media Tracker Configuration",
+        "menu_options": {
+          "general": "General Settings",
+          "devices": "Manage Devices"
+        }
+      },
+      "general": {
+        "title": "General Settings",
+        "description": "Configure core integration settings",
+        "data": {
+          "vlm_provider": "Vision Model Provider",
+          "gemini_api_key": "Gemini API Key",
+          "gemini_escalate": "Escalate weak results to the Flash tier",
+          "gemini_allow_gemma": "Allow Gemma overflow when daily quota is exhausted",
+          "ollama_url": "Ollama Server URL",
+          "model_name": "Ollama Model Name"
+        },
+        "data_description": {
+          "vlm_provider": "Ollama runs locally and keeps frames on your network. The Gemini API is much faster and more accurate, but sends screenshots of whatever is on your TV to Google.",
+          "gemini_api_key": "Required when the Gemini provider is selected. Free-tier keys are metered per model; the integration rotates across Flash-Lite models automatically.",
+          "gemini_escalate": "When Flash-Lite cannot identify the content, retry once on the higher-quality Flash tier (about 100 requests per day).",
+          "gemini_allow_gemma": "Gemma has a very large daily allowance but takes about 30 seconds per frame. Only used once the Flash-Lite budget is spent.",
+          "ollama_url": "Also used as the offline fallback when the Gemini provider is selected."
+        }
+      },
+      "devices": {
+        "title": "Manage Devices",
+        "description": "View and manage configured devices"
+      },
+      "add_device": {
+        "title": "Add New Device",
+        "description": "Scan for and add a new Apple TV or Google TV to the tracker"
+      },
+      "edit_device": {
+        "title": "Edit {name}",
+        "description": "Configure stream source, audio delay, and content guardrails for this device",
+        "data": {
+          "hardware_type": "Hardware Type",
+          "stream_source": "Stream URL",
+          "cast_stream_source": "High-Quality Cast Stream URL (Optional)",
+          "fallback_adb_ip": "Fallback ADB IP",
+          "add_another": "Add another device?",
+          "cast_audio_delay": "Audio Delay (seconds)",
+          "ratings": "Restricted Ratings",
+          "tags": "Restricted Content Tags",
+          "custom_tags": "Custom Restricted Keywords",
+          "delete_device": "Delete This Device"
+        },
+        "data_description": {
+          "ratings": "Select standard ratings to block (e.g., R, TV-MA). If the content matches, it will be skipped.",
+          "tags": "Select AI-generated mood tags to block (e.g., Violence, Gore, Nudity).",
+          "custom_tags": "Comma-separated specific words or show titles to block (e.g., 'Peppa Pig, Horror').",
+          "delete_device": "Check this box and hit Submit to permanently delete this device from the integration."
+        }
+      }
+    }
+  },
+  "device_automation": {
+    "trigger_type": {
+      "guardrail_violation": "Content guardrail was violated on this device",
+      "room_followed": "Media followed to this device",
+      "show_started": "A show or movie started playing",
+      "sporting_event_started": "A sporting event started playing"
+    }
+  }
+}

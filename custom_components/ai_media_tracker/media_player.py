@@ -33,6 +33,16 @@ class AIMediaPlayer(MediaPlayerEntity):
         self._attr_unique_id = f"ai_media_tracker_player_{slug}"
         self.entity_id = f"media_player.ai_media_{slug}"
 
+    @property
+    def device_info(self):
+        slug = self.player_name.lower().replace(" ", "_")
+        return {
+            "identifiers": {(DOMAIN, slug)},
+            "name": f"AI Media Tracker - {self.player_name}",
+            "manufacturer": "Antigravity",
+            "model": "AI Media Tracker Node"
+        }
+
     async def async_added_to_hass(self):
         """Run when entity is added to hass."""
         from homeassistant.core import callback
@@ -137,8 +147,14 @@ class AIMediaPlayer(MediaPlayerEntity):
             ep = camera_state.attributes.get("entity_picture")
             camera_stream_url = ep.replace("/api/camera_proxy/", "/api/camera_proxy_stream/")
 
+        active_routes = data.get("active_routes", {})
+        active_casts = [tgt for tgt, src in active_routes.items() if src == self.player_name]
+
+        group_mgr = data.get("group_mgr")
+        target_groups = group_mgr.groups if group_mgr else {}
+
         if not media_state:
-            return {"proxy_player": True, "player_name": self.player_name, "camera_stream_url": camera_stream_url, "camera_entity_id": camera_entity_id, "cast_targets": self._compute_cast_targets()}
+            return {"proxy_player": True, "player_name": self.player_name, "camera_stream_url": camera_stream_url, "camera_entity_id": camera_entity_id, "cast_targets": self._compute_cast_targets(), "active_casts": active_casts, "target_groups": target_groups}
 
         return {
             "scene_analysis": getattr(media_state, "scene_analysis", {}),
@@ -152,9 +168,13 @@ class AIMediaPlayer(MediaPlayerEntity):
             "show_info": getattr(media_state, "show_info", {}),
             "venue": getattr(media_state, "venue", None),
             "tournament_name": getattr(media_state, "tournament_name", None),
+            "is_content_blocked": getattr(media_state, "is_content_blocked", False),
+            "content_violation_tag": getattr(media_state, "content_violation_tag", None),
             "proxy_player": True,
             "player_name": self.player_name,
             "camera_stream_url": camera_stream_url,
             "camera_entity_id": camera_entity_id,
             "cast_targets": self._compute_cast_targets(),
+            "active_casts": active_casts,
+            "target_groups": target_groups,
         }

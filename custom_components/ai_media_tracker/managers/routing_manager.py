@@ -28,9 +28,17 @@ class AudioProxyView(HomeAssistantView):
         for entry_id, data in self.hass.data[DOMAIN].items():
             if not isinstance(data, dict): continue
             cameras = data.get("cameras", {})
-            for cam in cameras.values():
+            for name, cam in cameras.items():
                 if cam._attr_unique_id == f"ai_tracker_camera_{slug}":
                     stream_source = cam._stream_source
+                    entry = self.hass.config_entries.async_get_entry(entry_id)
+                    if entry:
+                        for dev in entry.data.get("devices", []):
+                            if dev["name"] == name:
+                                cast_source = dev.get("cast_stream_source")
+                                if cast_source:
+                                    stream_source = cast_source
+                                break
                     break
             if stream_source:
                 break
@@ -107,6 +115,9 @@ class VideoProxyView(HomeAssistantView):
                     if entry:
                         for dev in entry.data.get("devices", []):
                             if dev["name"] == name:
+                                cast_source = dev.get("cast_stream_source")
+                                if cast_source:
+                                    stream_source = cast_source
                                 device_id = dev.get("device_id")
                                 audio_delay = entry.options.get(f"cast_audio_delay_{device_id}", 0.0)
                                 break
@@ -140,7 +151,10 @@ class VideoProxyView(HomeAssistantView):
             
         cmd.extend([
             "-c:v", "copy",
-            "-c:a", "copy",
+            "-c:a", "aac",
+            "-b:a", "128k",
+            "-ac", "2",
+            "-ar", "44100",
             "-f", "mpegts",
             "pipe:1"
         ])
@@ -187,7 +201,11 @@ class StreamMultiplexer:
     async def _start_stream(self, slug, stream_source, audio_delay):
         _LOGGER.info("Starting FFmpeg multiplexer for %s", slug)
         ffmpeg_bin = get_ffmpeg_manager(self.hass).binary
-        cmd = [ffmpeg_bin]
+        cmd = [
+            ffmpeg_bin,
+            "-fflags", "nobuffer",
+            "-flags", "low_delay"
+        ]
         
         if audio_delay > 0:
             cmd.extend(["-itsoffset", str(audio_delay), "-i", stream_source, "-i", stream_source, "-map", "1:v", "-map", "0:a"])
@@ -201,6 +219,9 @@ class StreamMultiplexer:
         cmd.extend([
             "-c:v", "copy",
             "-c:a", "aac",
+            "-b:a", "128k",
+            "-ac", "2",
+            "-ar", "44100",
             "-f", "mpegts",
             "-flush_packets", "1",
             "pipe:1"
@@ -280,6 +301,9 @@ class WebSocketProxyView(HomeAssistantView):
                     if entry:
                         for dev in entry.data.get("devices", []):
                             if dev["name"] == name:
+                                cast_source = dev.get("cast_stream_source")
+                                if cast_source:
+                                    stream_source = cast_source
                                 device_id = dev.get("device_id")
                                 audio_delay = entry.options.get(f"cast_audio_delay_{device_id}", 0.0)
                                 break
@@ -330,10 +354,21 @@ class ActiveCastProxyView(HomeAssistantView):
         # Also return the HA internal URL so the web app knows where to connect the WebSocket
         base_url = get_url(self.hass, prefer_internal=True)
         return web.json_response({"slug": active_slug, "base_url": base_url}, headers={"Access-Control-Allow-Origin": "*"})
+
+class RoutingManager:
     @staticmethod
     async def cast_stream(hass, config_entry, source_player_name, target_receivers):
         from ..const import DOMAIN
         data = hass.data[DOMAIN][config_entry.entry_id]
+        
+        # Expand target_receivers to include children
+        group_mgr = data.get("group_mgr")
+        if group_mgr:
+            expanded_receivers = set(target_receivers)
+            for r in target_receivers:
+                children = group_mgr.groups.get(r, [])
+                expanded_receivers.update(children)
+            target_receivers = list(expanded_receivers)
         
         slug = source_player_name.lower().replace(" ", "_")
         camera_entity_id = f"camera.ai_tracker_screen_{slug}"
@@ -363,63 +398,141 @@ class ActiveCastProxyView(HomeAssistantView):
             pass
         
         for receiver in target_receivers:
-            platform = receiver.split(".")[0]
-            if platform == "media_player":
-                # Save the active slug for the ActiveCastProxyView to poll
-                if "active_cast_slug" not in hass.data[DOMAIN]:
-                    hass.data[DOMAIN]["active_cast_slug"] = None
-                hass.data[DOMAIN]["active_cast_slug"] = slug
-                
-                if custom_app_id:
-                    def send_cast_message():
-                        mp_component = hass.data.get("media_player")
-                        if mp_component:
-                            entity = mp_component.get_entity(receiver)
-                            if entity and hasattr(entity, "_get_chromecast"):
-                                chromecast = entity._get_chromecast()
-                                if chromecast:
-                                    import pychromecast.controllers
-                                    import time
-                                    
-                                    _LOGGER.info("Starting custom cast app %s on %s", custom_app_id, receiver)
-                                    chromecast.start_app(custom_app_id)
-                                    time.sleep(1.5) # Wait for app to boot before sending message
-                                    
-                                    class AIMediaController(pychromecast.controllers.BaseController):
-                                        def __init__(self):
-                                            super().__init__("urn:x-cast:com.ai_media_tracker")
-                                            
-                                    controller = AIMediaController()
-                                    chromecast.register_handler(controller)
-                                    
-                                    ws_url = base_stream_url.replace("http://", "ws://").replace("https://", "wss://").replace("/video/", "/ws/").replace(".ts", "")
-                                    _LOGGER.info("Sending WS URL to cast device: %s", ws_url)
-                                    controller.send_message({"type": "connect", "ws_url": ws_url})
-                                    return True
-                        return False
-                        
-                    sent = await hass.async_add_executor_job(send_cast_message)
-                    if sent:
-                        continue
-                        
-                # Fallback to standard play_media
-                extra_data = {}
-                if custom_app_id:
-                    extra_data["app_id"] = custom_app_id
-                    stream_url = "http://localhost/dummy"
-                else:
-                    stream_url = base_stream_url
-                
+            data.setdefault("active_routes", {})[receiver] = source_player_name
+            
+            # Determine the underlying platform of the receiver
+            entity_entry = registry.async_get(receiver)
+            integration_platform = entity_entry.platform if entity_entry else "unknown"
+            
+            if integration_platform in AUDIO_ONLY_PLATFORMS:
+                _LOGGER.info("Casting AUDIO stream via play_media from %s to %s (platform: %s)", source_player_name, receiver, integration_platform)
                 await hass.services.async_call("media_player", "play_media", {
                     "entity_id": receiver,
-                    "media_content_id": stream_url,
-                    "media_content_type": "video/mp4",
-                    "extra": extra_data
+                    "media_content_id": full_mp3_url,
+                    "media_content_type": "music"
                 }, blocking=False)
-            else:
-                _LOGGER.info("Casting VIDEO stream via camera.play_stream from %s to %s (platform: %s)", camera_entity_id, receiver, platform)
+                continue
+
+            # It's a video device
+            if "active_cast_slug" not in hass.data[DOMAIN]:
+                hass.data[DOMAIN]["active_cast_slug"] = None
+            hass.data[DOMAIN]["active_cast_slug"] = slug
+            
+            if integration_platform == "apple_tv":
+                _LOGGER.info("Casting VIDEO stream via camera.play_stream (HLS) to Apple TV %s", receiver)
                 await hass.services.async_call("camera", "play_stream", {
                     "entity_id": camera_entity_id,
                     "media_player": receiver,
                     "format": "hls"
                 }, blocking=False)
+                continue
+
+            if integration_platform == "cast" and custom_app_id:
+                def send_cast_message():
+                    mp_component = hass.data.get("media_player")
+                    if mp_component:
+                        entity = mp_component.get_entity(receiver)
+                        _LOGGER.info("send_cast_message: Found entity %s: %s", receiver, type(entity))
+                        if entity:
+                            chromecast = getattr(entity, "_chromecast", None)
+                            if not chromecast and hasattr(entity, "cast_device"):
+                                chromecast = entity.cast_device
+                            if not chromecast and hasattr(entity, "_get_chromecast"):
+                                try:
+                                    chromecast = entity._get_chromecast()
+                                except Exception as e:
+                                    _LOGGER.error("Failed to call _get_chromecast: %s", e)
+                                    
+                            if chromecast:
+                                import pychromecast.controllers
+                                import pychromecast.error
+                                import time
+                                
+                                _LOGGER.info("Connecting to cast device %s...", receiver)
+                                try:
+                                    chromecast.wait(5)
+                                except Exception as e:
+                                    _LOGGER.warning("Wait for cast device failed (might still be connected): %s", e)
+                                    
+                                _LOGGER.info("Starting custom cast app %s on %s", custom_app_id, receiver)
+                                try:
+                                    chromecast.start_app(custom_app_id)
+                                except pychromecast.error.RequestTimeout:
+                                    _LOGGER.warning("Cast device %s timed out during start_app. It might just be slow to boot. Proceeding anyway...", receiver)
+                                except Exception as e:
+                                    if type(e).__name__ == "NotConnected":
+                                        _LOGGER.error("Cast device %s is not connected. Failed to start app.", receiver)
+                                    elif type(e).__name__ == "LaunchError":
+                                        _LOGGER.error("Cast device %s actively rejected the App ID %s. Ensure it is registered and rebooted.", receiver, custom_app_id)
+                                    else:
+                                        _LOGGER.error("Unexpected error starting cast app: %s", e)
+                                    return False
+                                    
+                                time.sleep(3.0) # Wait a bit longer for Android TVs to boot the app
+                                
+                                class AIMediaController(pychromecast.controllers.BaseController):
+                                    def __init__(self):
+                                        super().__init__("urn:x-cast:com.ai_media_tracker")
+                                        
+                                controller = AIMediaController()
+                                chromecast.register_handler(controller)
+                                
+                                ws_url = base_stream_url.replace("http://", "ws://").replace("https://", "wss://").replace("/video/", "/ws/").replace(".ts", "")
+                                _LOGGER.info("Sending WS URL to cast device: %s", ws_url)
+                                controller.send_message({"type": "connect", "ws_url": ws_url})
+                                return True
+                            else:
+                                _LOGGER.error("Entity %s does not have a chromecast object! Attributes: %s", receiver, dir(entity))
+                    else:
+                        _LOGGER.error("media_player component not loaded in hass.data!")
+                    return False
+                    
+                sent = await hass.async_add_executor_job(send_cast_message)
+                if sent:
+                    continue
+                    
+                # If custom app fails, fallback to HLS
+                _LOGGER.info("Custom app failed on %s, falling back to camera.play_stream (HLS)", receiver)
+                await hass.services.async_call("camera", "play_stream", {
+                    "entity_id": camera_entity_id,
+                    "media_player": receiver,
+                    "format": "hls"
+                }, blocking=False)
+                continue
+                    
+            # Fallback for standard TVs (Samsung, Roku, etc.) or when no custom app id is defined
+            _LOGGER.info("Casting VIDEO stream via play_media (mp4/ts) to %s (platform: %s)", receiver, integration_platform)
+            await hass.services.async_call("media_player", "play_media", {
+                "entity_id": receiver,
+                "media_content_id": base_stream_url,
+                "media_content_type": "video/mp4"
+            }, blocking=False)
+
+                
+        if p := data.get("players", {}).get(source_player_name):
+            p.async_write_ha_state()
+
+    @staticmethod
+    async def stop_cast(hass, config_entry, source_player_name, target_receivers):
+        from ..const import DOMAIN
+        data = hass.data[DOMAIN][config_entry.entry_id]
+        
+        # Expand target_receivers to include children
+        group_mgr = data.get("group_mgr")
+        if group_mgr:
+            expanded_receivers = set(target_receivers)
+            for r in target_receivers:
+                children = group_mgr.groups.get(r, [])
+                expanded_receivers.update(children)
+            target_receivers = list(expanded_receivers)
+            
+        for receiver in target_receivers:
+            if receiver in data.get("active_routes", {}):
+                del data["active_routes"][receiver]
+            
+            await hass.services.async_call("media_player", "turn_off", {
+                "entity_id": receiver
+            }, blocking=False)
+            
+        if p := data.get("players", {}).get(source_player_name):
+            p.async_write_ha_state()
